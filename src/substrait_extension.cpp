@@ -18,6 +18,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #endif
 
 namespace duckdb {
@@ -56,8 +57,7 @@ struct ToSubstraitFunctionData : public TableFunctionData {
 		disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
 		disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
 		disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
-		// If error(varchar) gets implemented in substrait this can be removed
-		context.config.scalar_subquery_error_on_multiple_rows = false;
+		// Note: scalar_subquery_error_on_multiple_rows was removed in DuckDB v1.4.0
 		DBConfig::GetConfig(context).options.disabled_optimizers = disabled_optimizers;
 	}
 
@@ -373,8 +373,11 @@ void InitializeFromSubstraitJSON(const Connection &con) {
 	catalog.CreateTableFunction(*con.context, from_sub_info_json);
 }
 
-void SubstraitExtension::Load(DuckDB &db) {
-	Connection con(db);
+void SubstraitExtension::Load(ExtensionLoader &loader) {
+	// Get the DatabaseInstance from the loader
+	auto &db_instance = loader.GetDatabaseInstance();
+	DuckDB db_wrapper(db_instance);
+	Connection con(db_wrapper);
 	con.BeginTransaction();
 
 	InitializeGetSubstrait(con);
@@ -392,14 +395,29 @@ std::string SubstraitExtension::Name() {
 
 } // namespace duckdb
 
+namespace {
+static void LoadSubstraitExtension(duckdb::DatabaseInstance &db) {
+	duckdb::DuckDB db_wrapper(db);
+	db_wrapper.LoadStaticExtension<duckdb::SubstraitExtension>();
+}
+} // namespace
+
 extern "C" {
 
 DUCKDB_EXTENSION_API void substrait_init(duckdb::DatabaseInstance &db) {
-	duckdb::DuckDB db_wrapper(db);
-	db_wrapper.LoadExtension<duckdb::SubstraitExtension>();
+	LoadSubstraitExtension(db);
+}
+
+DUCKDB_EXTENSION_API void substrait_duckdb_cpp_init(duckdb::ExtensionLoader &loader) {
+	duckdb::SubstraitExtension extension;
+	extension.Load(loader);
 }
 
 DUCKDB_EXTENSION_API const char *substrait_version() {
+	return duckdb::DuckDB::LibraryVersion();
+}
+
+DUCKDB_EXTENSION_API const char *substrait_duckdb_cpp_version() {
 	return duckdb::DuckDB::LibraryVersion();
 }
 }
