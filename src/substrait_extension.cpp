@@ -285,17 +285,17 @@ struct FromSubstraitFunctionData : public TableFunctionData {
 	FromSubstraitFunctionData() = default;
 	shared_ptr<Relation> plan;
 	unique_ptr<QueryResult> res;
-	unique_ptr<Connection> conn;
+	// Note: Connection removed - was never used and caused context lifetime issues
 };
 
 static unique_ptr<FunctionData> SubstraitBind(ClientContext &context, TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types, vector<string> &names, bool is_json) {
 	auto result = make_uniq<FromSubstraitFunctionData>();
-	result->conn = make_uniq<Connection>(*context.db);
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("from_substrait cannot be called with a NULL parameter");
 	}
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
+	// Use non-owning shared_ptr to the existing context (do_nothing deleter prevents cleanup)
 	shared_ptr<ClientContext> c_ptr(&context, do_nothing);
 	result->plan = SubstraitPlanToDuckDBRel(c_ptr, serialized, is_json);
 	for (auto &column : result->plan->Columns()) {
@@ -318,8 +318,11 @@ static unique_ptr<FunctionData> FromSubstraitBindJSON(ClientContext &context, Ta
 static void FromSubFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &data = data_p.bind_data->CastNoConst<FromSubstraitFunctionData>();
 	if (!data.res) {
-		auto con = Connection(*context.db);
-		data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
+		// FIX: Use the existing context parameter instead of creating a new connection.
+		// This ensures execution happens in the same context with the same task scheduler.
+		// The no-op deleter prevents the context from being destroyed when the shared_ptr goes out of scope.
+		shared_ptr<ClientContext> context_ptr(&context, [](ClientContext*){});
+		data.plan->context = make_shared_ptr<ClientContextWrapper>(context_ptr);
 		data.res = data.plan->Execute();
 	}
 	auto result_chunk = data.res->Fetch();
