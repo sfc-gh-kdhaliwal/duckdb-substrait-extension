@@ -266,7 +266,8 @@ static unique_ptr<TableRef> SubstraitBindReplace(ClientContext &context, TableFu
 	}
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
 	shared_ptr<ClientContext> c_ptr(&context, do_nothing);
-	auto plan = SubstraitPlanToDuckDBRel(c_ptr, serialized, is_json);
+	// Pass acquire_lock=true for proper lock management during bind-time relation creation
+	auto plan = SubstraitPlanToDuckDBRel(c_ptr, serialized, is_json, true);
 	if (!plan.get()->IsReadOnly()) {
 		return nullptr;
 	}
@@ -297,7 +298,8 @@ static unique_ptr<FunctionData> SubstraitBind(ClientContext &context, TableFunct
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
 	// Use non-owning shared_ptr to the existing context (do_nothing deleter prevents cleanup)
 	shared_ptr<ClientContext> c_ptr(&context, do_nothing);
-	result->plan = SubstraitPlanToDuckDBRel(c_ptr, serialized, is_json);
+	// Pass acquire_lock=true to properly manage locks when executing from within table function context
+	result->plan = SubstraitPlanToDuckDBRel(c_ptr, serialized, is_json, true);
 	for (auto &column : result->plan->Columns()) {
 		return_types.emplace_back(column.Type());
 		names.emplace_back(column.Name());
