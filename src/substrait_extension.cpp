@@ -291,19 +291,24 @@ struct FromSubstraitFunctionData : public TableFunctionData {
 
 static unique_ptr<FunctionData> SubstraitBind(ClientContext &context, TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types, vector<string> &names, bool is_json) {
+	std::cerr << "[DEBUG] SubstraitBind: Called" << std::endl;
 	auto result = make_uniq<FromSubstraitFunctionData>();
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("from_substrait cannot be called with a NULL parameter");
 	}
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
+	std::cerr << "[DEBUG] SubstraitBind: Got serialized plan, size=" << serialized.size() << " bytes" << std::endl;
 	// Use non-owning shared_ptr to the existing context (do_nothing deleter prevents cleanup)
 	shared_ptr<ClientContext> c_ptr(&context, do_nothing);
 	// Pass acquire_lock=true to properly manage locks when executing from within table function context
+	std::cerr << "[DEBUG] SubstraitBind: Calling SubstraitPlanToDuckDBRel with acquire_lock=true" << std::endl;
 	result->plan = SubstraitPlanToDuckDBRel(c_ptr, serialized, is_json, true);
+	std::cerr << "[DEBUG] SubstraitBind: Getting columns" << std::endl;
 	for (auto &column : result->plan->Columns()) {
 		return_types.emplace_back(column.Type());
 		names.emplace_back(column.Name());
 	}
+	std::cerr << "[DEBUG] SubstraitBind: Done, returning" << std::endl;
 	return std::move(result);
 }
 
@@ -320,18 +325,25 @@ static unique_ptr<FunctionData> FromSubstraitBindJSON(ClientContext &context, Ta
 static void FromSubFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &data = data_p.bind_data->CastNoConst<FromSubstraitFunctionData>();
 	if (!data.res) {
+		std::cerr << "[DEBUG] FromSubFunction: About to execute plan" << std::endl;
 		// FIX: Use the existing context parameter instead of creating a new connection.
 		// This ensures execution happens in the same context with the same task scheduler.
 		// The no-op deleter prevents the context from being destroyed when the shared_ptr goes out of scope.
 		shared_ptr<ClientContext> context_ptr(&context, [](ClientContext*){});
 		data.plan->context = make_shared_ptr<ClientContextWrapper>(context_ptr);
+		std::cerr << "[DEBUG] FromSubFunction: Calling plan->Execute()" << std::endl;
 		data.res = data.plan->Execute();
+		std::cerr << "[DEBUG] FromSubFunction: plan->Execute() returned" << std::endl;
 	}
+	std::cerr << "[DEBUG] FromSubFunction: Fetching result chunk" << std::endl;
 	auto result_chunk = data.res->Fetch();
 	if (!result_chunk) {
+		std::cerr << "[DEBUG] FromSubFunction: No more chunks, returning" << std::endl;
 		return;
 	}
+	std::cerr << "[DEBUG] FromSubFunction: Moving chunk to output" << std::endl;
 	output.Move(*result_chunk);
+	std::cerr << "[DEBUG] FromSubFunction: Done" << std::endl;
 }
 
 void InitializeGetSubstrait(const Connection &con) {
