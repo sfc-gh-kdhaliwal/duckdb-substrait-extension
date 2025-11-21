@@ -267,15 +267,34 @@ static void ToJsonFunction(ClientContext &context, TableFunctionInput &data_p, D
 }
 
 static unique_ptr<TableRef> SubstraitBindReplace(ClientContext &context, TableFunctionBindInput &input, bool is_json) {
+	// This function implements the bind_replace pattern (same as DuckDB's query() function)
+	//
+	// Key principle: Return a TableRef (AST node), NEVER call Execute()
+	//
+	// Flow:
+	// 1. Parse Substrait plan (binary or JSON)
+	// 2. Transform to DuckDB Relation (logical representation)
+	// 3. Extract TableRef from Relation (AST representation)
+	// 4. Return TableRef to be incorporated into outer query's plan
+	//
+	// DuckDB will execute the combined plan in a single execution context.
+	// No nested query execution = no lock conflicts.
+
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("from_substrait cannot be called with a NULL parameter");
 	}
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
+
+	// Transform Substrait → DuckDB Relation (no execution)
 	shared_ptr<ClientContext> c_ptr(&context, do_nothing);
 	auto plan = SubstraitPlanToDuckDBRel(c_ptr, serialized, is_json);
+
+	// Only read-only operations can be incorporated into query plans
 	if (!plan.get()->IsReadOnly()) {
 		return nullptr;
 	}
+
+	// Extract TableRef (AST node) from Relation - this becomes part of outer query
 	return plan->GetTableRef();
 }
 
@@ -287,102 +306,9 @@ static unique_ptr<TableRef> FromSubstraitBindReplaceJSON(ClientContext &context,
 	return SubstraitBindReplace(context, input, true);
 }
 
-struct FromSubstraitFunctionData : public TableFunctionData {
-	FromSubstraitFunctionData() = default;
-	shared_ptr<Relation> plan;
-	//! Materialized result - executed during bind phase
-	unique_ptr<MaterializedQueryResult> materialized_result;
-	//! Current chunk index for scanning materialized results
-	idx_t current_chunk_idx = 0;
-	//! Current row within the current chunk
-	idx_t current_row_in_chunk = 0;
-	//! A weak pointer to the context - does NOT keep connection alive
-	weak_ptr<ClientContext> context;
-};
-
-static unique_ptr<FunctionData> SubstraitBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names, bool is_json) {
-	auto result = make_uniq<FromSubstraitFunctionData>();
-	// Store weak_ptr to existing context instead of creating new Connection
-	result->context = context.shared_from_this();
-	if (input.inputs[0].IsNull()) {
-		throw BinderException("from_substrait cannot be called with a NULL parameter");
-	}
-	string serialized = input.inputs[0].GetValueUnsafe<string>();
-
-	// Transform Substrait plan to DuckDB Relation
-	shared_ptr<ClientContext> c_ptr(&context, do_nothing);
-	result->plan = SubstraitPlanToDuckDBRel(c_ptr, serialized, is_json);
-
-	// CRITICAL: Execute and materialize the plan during bind phase (not scan phase)
-	// This prevents nested transaction issues in DuckDB 1.4
-	auto context_ref = context.shared_from_this();
-	result->plan->context = make_shared_ptr<ClientContextWrapper>(context_ref);
-	auto query_result = result->plan->Execute();
-
-	// Check for errors
-	if (query_result->HasError()) {
-		query_result->ThrowError();
-	}
-
-	// Materialize the entire result during bind
-	if (query_result->type == QueryResultType::STREAM_RESULT) {
-		auto &stream_result = query_result->Cast<StreamQueryResult>();
-		result->materialized_result = stream_result.Materialize();
-	} else if (query_result->type == QueryResultType::MATERIALIZED_RESULT) {
-		result->materialized_result = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(query_result));
-	} else {
-		throw InvalidInputException("Unexpected query result type");
-	}
-
-	// Set up return types from the plan columns
-	for (auto &column : result->plan->Columns()) {
-		return_types.emplace_back(column.Type());
-		names.emplace_back(column.Name());
-	}
-	return std::move(result);
-}
-
-static unique_ptr<FunctionData> FromSubstraitBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
-	return SubstraitBind(context, input, return_types, names, false);
-}
-
-static unique_ptr<FunctionData> FromSubstraitBindJSON(ClientContext &context, TableFunctionBindInput &input,
-                                                      vector<LogicalType> &return_types, vector<string> &names) {
-	return SubstraitBind(context, input, return_types, names, true);
-}
-
-static void FromSubFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &data = data_p.bind_data->CastNoConst<FromSubstraitFunctionData>();
-
-	// Check if we have a valid materialized result
-	if (!data.materialized_result) {
-		throw InternalException("from_substrait: No materialized result available");
-	}
-
-	// Check if we're done with all data
-	auto &collection = data.materialized_result->Collection();
-	if (data.current_chunk_idx >= collection.ChunkCount()) {
-		// No more data to return
-		return;
-	}
-
-	// Fetch the current chunk
-	auto chunk = collection.GetChunk(data.current_chunk_idx);
-	if (!chunk || chunk->size() == 0) {
-		return;
-	}
-
-	// Copy chunk data to output
-	output.SetCardinality(chunk->size());
-	for (idx_t col_idx = 0; col_idx < chunk->ColumnCount(); col_idx++) {
-		output.data[col_idx].Reference(chunk->data[col_idx]);
-	}
-
-	// Move to next chunk
-	data.current_chunk_idx++;
-}
+// NOTE: The from_substrait functions use the bind_replace pattern (like DuckDB's query() function)
+// This avoids nested query execution and lock conflicts by incorporating the Substrait plan
+// directly into the outer query's AST, rather than executing it separately.
 
 void InitializeGetSubstrait(const Connection &con) {
 	auto &catalog = Catalog::GetSystemCatalog(*con.context);
@@ -409,10 +335,16 @@ void InitializeGetSubstraitJSON(const Connection &con) {
 void InitializeFromSubstrait(const Connection &con) {
 	auto &catalog = Catalog::GetSystemCatalog(*con.context);
 
-	// create the from_substrait table function that allows us to get a query
-	// result from a substrait plan
-	// IMPORTANT: Use ONLY bind_replace to avoid nested query execution in DuckDB 1.4+
-	// bind_replace incorporates the plan directly into the query tree without executing
+	// Create the from_substrait table function that allows executing a Substrait plan
+	//
+	// IMPORTANT: This follows the same pattern as DuckDB's built-in query() function:
+	// - Uses ONLY bind_replace (no bind or scan functions)
+	// - Transforms Substrait plan into a TableRef (AST node) during bind phase
+	// - Returns the TableRef which is incorporated into the outer query plan
+	// - DuckDB executes everything in a single unified execution context
+	// - This avoids nested query execution and lock conflicts
+	//
+	// NO Execute() calls are made - the Substrait plan becomes part of the query AST.
 	TableFunction from_sub_func("from_substrait", {LogicalType::BLOB}, nullptr, nullptr);
 	from_sub_func.bind_replace = FromSubstraitBindReplace;
 	CreateTableFunctionInfo from_sub_info(from_sub_func);
@@ -421,10 +353,8 @@ void InitializeFromSubstrait(const Connection &con) {
 
 void InitializeFromSubstraitJSON(const Connection &con) {
 	auto &catalog = Catalog::GetSystemCatalog(*con.context);
-	// create the from_substrait table function that allows us to get a query
-	// result from a substrait plan
-	// IMPORTANT: Use ONLY bind_replace to avoid nested query execution in DuckDB 1.4+
-	// bind_replace incorporates the plan directly into the query tree without executing
+
+	// Same pattern as from_substrait, but accepts JSON-formatted Substrait plans
 	TableFunction from_sub_func_json("from_substrait_json", {LogicalType::VARCHAR}, nullptr, nullptr);
 	from_sub_func_json.bind_replace = FromSubstraitBindReplaceJSON;
 	CreateTableFunctionInfo from_sub_info_json(from_sub_func_json);
