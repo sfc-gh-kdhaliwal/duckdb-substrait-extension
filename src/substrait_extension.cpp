@@ -285,13 +285,15 @@ struct FromSubstraitFunctionData : public TableFunctionData {
 	FromSubstraitFunctionData() = default;
 	shared_ptr<Relation> plan;
 	unique_ptr<QueryResult> res;
-	unique_ptr<Connection> conn;
+	//! A weak pointer to the context - does NOT keep connection alive
+	weak_ptr<ClientContext> context;
 };
 
 static unique_ptr<FunctionData> SubstraitBind(ClientContext &context, TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types, vector<string> &names, bool is_json) {
 	auto result = make_uniq<FromSubstraitFunctionData>();
-	result->conn = make_uniq<Connection>(*context.db);
+	// Store weak_ptr to existing context instead of creating new Connection
+	result->context = context.shared_from_this();
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("from_substrait cannot be called with a NULL parameter");
 	}
@@ -318,8 +320,13 @@ static unique_ptr<FunctionData> FromSubstraitBindJSON(ClientContext &context, Ta
 static void FromSubFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &data = data_p.bind_data->CastNoConst<FromSubstraitFunctionData>();
 	if (!data.res) {
-		auto con = Connection(*context.db);
-		data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
+		// Lock the weak_ptr to get temporary shared_ptr
+		auto context_ref = data.context.lock();
+		if (!context_ref) {
+			throw InvalidInputException("from_substrait: Context is no longer valid");
+		}
+		// Use the existing context instead of creating a new Connection
+		data.plan->context = make_shared_ptr<ClientContextWrapper>(context_ref);
 		data.res = data.plan->Execute();
 	}
 	auto result_chunk = data.res->Fetch();
