@@ -153,16 +153,22 @@ shared_ptr<Relation> SubstraitPlanToDuckDBRel(shared_ptr<ClientContext> &context
 
 //! This function matches results of substrait plans with direct Duckdb queries
 //! Is only executed when pragma enable_verification = true
-//! It creates extra connections to be able to execute the consumed DuckDB Plan
-//! And the SQL query itself, ideally this wouldn't be necessary and won't
-//! work for round-tripping tests over temporary objects.
+//! IMPORTANT: In DuckDB 1.4+, we cannot create new Connections during active queries
+//! as this triggers deadlocks in the concurrent checkpoint logic.
+//! Instead, we use the existing context to prepare and execute statements.
 static void VerifySubstraitRoundtrip(unique_ptr<LogicalOperator> &query_plan, ClientContext &context,
                                      ToSubstraitFunctionData &data, const string &serialized, bool is_json) {
-	// We round-trip the generated json and verify if the result is the same
-	auto con = Connection(*context.db);
-	auto actual_result = con.Query(data.query);
-	auto con_2 = Connection(*context.db);
-	auto sub_relation = SubstraitPlanToDuckDBRel(con_2.context, serialized, is_json, true);
+	// Use existing context instead of creating new Connections
+	// This avoids the deadlock issue in DuckDB 1.4+
+
+	// Execute the original SQL query using the existing context
+	auto actual_result = context.Query(data.query);
+
+	// Transform Substrait plan back to DuckDB Relation using existing context
+	shared_ptr<ClientContext> c_ptr(&context, do_nothing);
+	auto sub_relation = SubstraitPlanToDuckDBRel(c_ptr, serialized, is_json, false);
+
+	// Execute the Substrait plan using the existing context
 	auto substrait_result = sub_relation->Execute();
 	substrait_result->names = actual_result->names;
 	unique_ptr<MaterializedQueryResult> substrait_materialized;
@@ -405,7 +411,9 @@ void InitializeFromSubstrait(const Connection &con) {
 
 	// create the from_substrait table function that allows us to get a query
 	// result from a substrait plan
-	TableFunction from_sub_func("from_substrait", {LogicalType::BLOB}, FromSubFunction, FromSubstraitBind);
+	// IMPORTANT: Use ONLY bind_replace to avoid nested query execution in DuckDB 1.4+
+	// bind_replace incorporates the plan directly into the query tree without executing
+	TableFunction from_sub_func("from_substrait", {LogicalType::BLOB}, nullptr, nullptr);
 	from_sub_func.bind_replace = FromSubstraitBindReplace;
 	CreateTableFunctionInfo from_sub_info(from_sub_func);
 	catalog.CreateTableFunction(*con.context, from_sub_info);
@@ -415,8 +423,9 @@ void InitializeFromSubstraitJSON(const Connection &con) {
 	auto &catalog = Catalog::GetSystemCatalog(*con.context);
 	// create the from_substrait table function that allows us to get a query
 	// result from a substrait plan
-	TableFunction from_sub_func_json("from_substrait_json", {LogicalType::VARCHAR}, FromSubFunction,
-	                                 FromSubstraitBindJSON);
+	// IMPORTANT: Use ONLY bind_replace to avoid nested query execution in DuckDB 1.4+
+	// bind_replace incorporates the plan directly into the query tree without executing
+	TableFunction from_sub_func_json("from_substrait_json", {LogicalType::VARCHAR}, nullptr, nullptr);
 	from_sub_func_json.bind_replace = FromSubstraitBindReplaceJSON;
 	CreateTableFunctionInfo from_sub_info_json(from_sub_func_json);
 	catalog.CreateTableFunction(*con.context, from_sub_info_json);
