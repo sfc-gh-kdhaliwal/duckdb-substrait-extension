@@ -284,7 +284,12 @@ static unique_ptr<TableRef> FromSubstraitBindReplaceJSON(ClientContext &context,
 struct FromSubstraitFunctionData : public TableFunctionData {
 	FromSubstraitFunctionData() = default;
 	shared_ptr<Relation> plan;
-	unique_ptr<QueryResult> res;
+	//! Materialized result - executed during bind phase
+	unique_ptr<MaterializedQueryResult> materialized_result;
+	//! Current chunk index for scanning materialized results
+	idx_t current_chunk_idx = 0;
+	//! Current row within the current chunk
+	idx_t current_row_in_chunk = 0;
 	//! A weak pointer to the context - does NOT keep connection alive
 	weak_ptr<ClientContext> context;
 };
@@ -298,8 +303,33 @@ static unique_ptr<FunctionData> SubstraitBind(ClientContext &context, TableFunct
 		throw BinderException("from_substrait cannot be called with a NULL parameter");
 	}
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
+
+	// Transform Substrait plan to DuckDB Relation
 	shared_ptr<ClientContext> c_ptr(&context, do_nothing);
 	result->plan = SubstraitPlanToDuckDBRel(c_ptr, serialized, is_json);
+
+	// CRITICAL: Execute and materialize the plan during bind phase (not scan phase)
+	// This prevents nested transaction issues in DuckDB 1.4
+	auto context_ref = context.shared_from_this();
+	result->plan->context = make_shared_ptr<ClientContextWrapper>(context_ref);
+	auto query_result = result->plan->Execute();
+
+	// Check for errors
+	if (query_result->HasError()) {
+		query_result->ThrowError();
+	}
+
+	// Materialize the entire result during bind
+	if (query_result->type == QueryResultType::STREAM_RESULT) {
+		auto &stream_result = query_result->Cast<StreamQueryResult>();
+		result->materialized_result = stream_result.Materialize();
+	} else if (query_result->type == QueryResultType::MATERIALIZED_RESULT) {
+		result->materialized_result = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(query_result));
+	} else {
+		throw InvalidInputException("Unexpected query result type");
+	}
+
+	// Set up return types from the plan columns
 	for (auto &column : result->plan->Columns()) {
 		return_types.emplace_back(column.Type());
 		names.emplace_back(column.Name());
@@ -319,21 +349,33 @@ static unique_ptr<FunctionData> FromSubstraitBindJSON(ClientContext &context, Ta
 
 static void FromSubFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &data = data_p.bind_data->CastNoConst<FromSubstraitFunctionData>();
-	if (!data.res) {
-		// Lock the weak_ptr to get temporary shared_ptr
-		auto context_ref = data.context.lock();
-		if (!context_ref) {
-			throw InvalidInputException("from_substrait: Context is no longer valid");
-		}
-		// Use the existing context instead of creating a new Connection
-		data.plan->context = make_shared_ptr<ClientContextWrapper>(context_ref);
-		data.res = data.plan->Execute();
+
+	// Check if we have a valid materialized result
+	if (!data.materialized_result) {
+		throw InternalException("from_substrait: No materialized result available");
 	}
-	auto result_chunk = data.res->Fetch();
-	if (!result_chunk) {
+
+	// Check if we're done with all data
+	auto &collection = data.materialized_result->Collection();
+	if (data.current_chunk_idx >= collection.ChunkCount()) {
+		// No more data to return
 		return;
 	}
-	output.Move(*result_chunk);
+
+	// Fetch the current chunk
+	auto chunk = collection.GetChunk(data.current_chunk_idx);
+	if (!chunk || chunk->size() == 0) {
+		return;
+	}
+
+	// Copy chunk data to output
+	output.SetCardinality(chunk->size());
+	for (idx_t col_idx = 0; col_idx < chunk->ColumnCount(); col_idx++) {
+		output.data[col_idx].Reference(chunk->data[col_idx]);
+	}
+
+	// Move to next chunk
+	data.current_chunk_idx++;
 }
 
 void InitializeGetSubstrait(const Connection &con) {
