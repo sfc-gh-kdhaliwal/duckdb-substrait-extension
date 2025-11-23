@@ -2,6 +2,7 @@
 
 #include "substrait_extension.hpp"
 #include "from_substrait.hpp"
+#include "from_substrait_ast.hpp"
 #include "to_substrait.hpp"
 
 #include "duckdb/execution/column_binding_resolver.hpp"
@@ -162,7 +163,16 @@ static void VerifySubstraitRoundtrip(unique_ptr<LogicalOperator> &query_plan, Cl
 	// This avoids the deadlock issue in DuckDB 1.4+
 
 	// Execute the original SQL query using the existing context
-	auto actual_result = context.Query(data.query);
+	auto actual_result = context.Query(data.query, false);
+
+	// Materialize the actual result
+	unique_ptr<MaterializedQueryResult> actual_materialized;
+	if (actual_result->type == QueryResultType::STREAM_RESULT) {
+		auto &stream_query = actual_result->Cast<StreamQueryResult>();
+		actual_materialized = stream_query.Materialize();
+	} else if (actual_result->type == QueryResultType::MATERIALIZED_RESULT) {
+		actual_materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(actual_result));
+	}
 
 	// Transform Substrait plan back to DuckDB Relation using existing context
 	shared_ptr<ClientContext> c_ptr(&context, do_nothing);
@@ -170,7 +180,7 @@ static void VerifySubstraitRoundtrip(unique_ptr<LogicalOperator> &query_plan, Cl
 
 	// Execute the Substrait plan using the existing context
 	auto substrait_result = sub_relation->Execute();
-	substrait_result->names = actual_result->names;
+	substrait_result->names = actual_materialized->names;
 	unique_ptr<MaterializedQueryResult> substrait_materialized;
 
 	if (substrait_result->type == QueryResultType::STREAM_RESULT) {
@@ -180,7 +190,7 @@ static void VerifySubstraitRoundtrip(unique_ptr<LogicalOperator> &query_plan, Cl
 	} else if (substrait_result->type == QueryResultType::MATERIALIZED_RESULT) {
 		substrait_materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(substrait_result));
 	}
-	auto &actual_col_coll = actual_result->Collection();
+	auto &actual_col_coll = actual_materialized->Collection();
 	auto &subs_col_coll = substrait_materialized->Collection();
 	string error_message;
 	if (!ColumnDataCollection::ResultEquals(actual_col_coll, subs_col_coll, error_message)) {
@@ -267,35 +277,21 @@ static void ToJsonFunction(ClientContext &context, TableFunctionInput &data_p, D
 }
 
 static unique_ptr<TableRef> SubstraitBindReplace(ClientContext &context, TableFunctionBindInput &input, bool is_json) {
-	// This function implements the bind_replace pattern (same as DuckDB's query() function)
+	// NEW: Use SubstraitToAST for pure AST transformation (no Relations, no binding)
 	//
-	// Key principle: Return a TableRef (AST node), NEVER call Execute()
-	//
-	// Flow:
-	// 1. Parse Substrait plan (binary or JSON)
-	// 2. Transform to DuckDB Relation (logical representation)
-	// 3. Extract TableRef from Relation (AST representation)
-	// 4. Return TableRef to be incorporated into outer query's plan
-	//
-	// DuckDB will execute the combined plan in a single execution context.
-	// No nested query execution = no lock conflicts.
+	// This avoids lock re-entrancy issues by building AST nodes directly
+	// instead of creating Relations that try to bind themselves.
 
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("from_substrait cannot be called with a NULL parameter");
 	}
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
 
-	// Transform Substrait → DuckDB Relation (no execution)
-	shared_ptr<ClientContext> c_ptr(&context, do_nothing);
-	auto plan = SubstraitPlanToDuckDBRel(c_ptr, serialized, is_json);
+	// Transform Substrait → DuckDB TableRef (pure AST, no binding!)
+	SubstraitToAST transformer(context, serialized, is_json);
+	auto table_ref = transformer.TransformPlanToTableRef();
 
-	// Only read-only operations can be incorporated into query plans
-	if (!plan.get()->IsReadOnly()) {
-		return nullptr;
-	}
-
-	// Extract TableRef (AST node) from Relation - this becomes part of outer query
-	return plan->GetTableRef();
+	return table_ref;  // ✅ Returns AST directly - DuckDB will bind it in the outer query context
 }
 
 static unique_ptr<TableRef> FromSubstraitBindReplace(ClientContext &context, TableFunctionBindInput &input) {

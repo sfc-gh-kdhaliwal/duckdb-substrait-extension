@@ -97,6 +97,7 @@ set(SUBSTRAIT_SOURCES
 set(EXTENSION_SOURCES
     src/to_substrait.cpp
     src/from_substrait.cpp
+    src/from_substrait_ast.cpp
     src/substrait_extension.cpp
     src/custom_extensions.cpp
     src/custom_extensions_generated.cpp

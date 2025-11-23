@@ -115,7 +115,7 @@ private:
 	static const unordered_map<std::string, std::string> function_names_remap;
 	static const case_insensitive_set_t valid_extract_subfields;
 	vector<ParsedExpression *> struct_expressions;
-	//! If we should acquire a client context lock when creating the relatiosn
+	//! If we should acquire a client context lock when creating the relations
 	const bool acquire_lock;
 };
 } // namespace duckdb
