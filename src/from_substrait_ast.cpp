@@ -1,12 +1,23 @@
 #include "from_substrait_ast.hpp"
 
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/positional_reference_expression.hpp"
+#include "duckdb/parser/expression/comparison_expression.hpp"
+#include "duckdb/parser/expression/conjunction_expression.hpp"
+#include "duckdb/parser/expression/operator_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/common/exception.hpp"
 
 #include "google/protobuf/util/json_util.h"
@@ -54,6 +65,58 @@ Value SubstraitToAST::TransformLiteralToValue(const substrait::Expression_Litera
 		return {literal.string()};
 	case substrait::Expression_Literal::LiteralTypeCase::kBoolean:
 		return Value(literal.boolean());
+	case substrait::Expression_Literal::LiteralTypeCase::kDecimal: {
+		const auto &substrait_decimal = literal.decimal();
+		if (substrait_decimal.value().size() != 16) {
+			throw InvalidInputException("Decimal value must have 16 bytes, but has " +
+			                            std::to_string(substrait_decimal.value().size()));
+		}
+		auto raw_value = reinterpret_cast<const uint64_t *>(substrait_decimal.value().c_str());
+		hugeint_t substrait_value {};
+		substrait_value.lower = raw_value[0];
+		substrait_value.upper = static_cast<int64_t>(raw_value[1]);
+		Value val = Value::HUGEINT(substrait_value);
+		auto decimal_type = LogicalType::DECIMAL(substrait_decimal.precision(), substrait_decimal.scale());
+		// cast to correct value
+		switch (decimal_type.InternalType()) {
+		case PhysicalType::INT8:
+			return Value::DECIMAL(val.GetValue<int8_t>(), substrait_decimal.precision(), substrait_decimal.scale());
+		case PhysicalType::INT16:
+			return Value::DECIMAL(val.GetValue<int16_t>(), substrait_decimal.precision(), substrait_decimal.scale());
+		case PhysicalType::INT32:
+			return Value::DECIMAL(val.GetValue<int32_t>(), substrait_decimal.precision(), substrait_decimal.scale());
+		case PhysicalType::INT64:
+			return Value::DECIMAL(val.GetValue<int64_t>(), substrait_decimal.precision(), substrait_decimal.scale());
+		case PhysicalType::INT128:
+			return Value::DECIMAL(substrait_value, substrait_decimal.precision(), substrait_decimal.scale());
+		default:
+			throw NotImplementedException("Unsupported internal type for decimal: %s", decimal_type.ToString());
+		}
+	}
+	case substrait::Expression_Literal::LiteralTypeCase::kDate: {
+		date_t date(literal.date());
+		return Value::DATE(date);
+	}
+	case substrait::Expression_Literal::LiteralTypeCase::kTime: {
+		dtime_t time(literal.time());
+		return Value::TIME(time);
+	}
+	case substrait::Expression_Literal::LiteralTypeCase::kIntervalYearToMonth: {
+		interval_t interval {};
+		interval.months = literal.interval_year_to_month().months();
+		interval.days = 0;
+		interval.micros = 0;
+		return Value::INTERVAL(interval);
+	}
+	case substrait::Expression_Literal::LiteralTypeCase::kIntervalDayToSecond: {
+		interval_t interval {};
+		interval.months = 0;
+		interval.days = literal.interval_day_to_second().days();
+		interval.micros = literal.interval_day_to_second().microseconds();
+		return Value::INTERVAL(interval);
+	}
+	case substrait::Expression_Literal::LiteralTypeCase::kVarChar:
+		return {literal.var_char().value()};
 	default:
 		throw NotImplementedException(
 		    "Literal type not yet implemented in AST transformer: %s",
@@ -65,10 +128,284 @@ unique_ptr<ParsedExpression> SubstraitToAST::TransformLiteralExpr(const substrai
 	return make_uniq<ConstantExpression>(TransformLiteralToValue(sexpr.literal()));
 }
 
+unique_ptr<ParsedExpression> SubstraitToAST::TransformSelectionExpr(const substrait::Expression &sexpr) {
+	// Substrait selection expressions reference columns via field positions
+	if (!sexpr.selection().has_direct_reference() || !sexpr.selection().direct_reference().has_struct_field()) {
+		throw SyntaxException("Can only have direct struct references in selections");
+	}
+
+	// Use positional reference (1-based in DuckDB)
+	auto field_idx = sexpr.selection().direct_reference().struct_field().field();
+	return make_uniq<PositionalReferenceExpression>(field_idx + 1);
+}
+
+string SubstraitToAST::FindFunction(uint64_t id) {
+	if (functions_map.find(id) == functions_map.end()) {
+		throw NotImplementedException("Could not find function with ID %s", to_string(id));
+	}
+	return functions_map[id];
+}
+
+string SubstraitToAST::RemoveFunctionExtension(const string &function_name) {
+	// Remove extension prefix (e.g., "substrait:add" -> "add")
+	string name;
+	for (auto &c : function_name) {
+		if (c == ':') {
+			break;
+		}
+		name += c;
+	}
+	return name;
+}
+
+unique_ptr<ParsedExpression> SubstraitToAST::TransformScalarFunctionExpr(const substrait::Expression &sexpr) {
+	auto &scalar_fun = sexpr.scalar_function();
+	auto function_name = FindFunction(scalar_fun.function_reference());
+	function_name = RemoveFunctionExtension(function_name);
+
+	// Transform function arguments
+	vector<unique_ptr<ParsedExpression>> children;
+	for (auto &sarg : scalar_fun.arguments()) {
+		if (sarg.has_value()) {
+			children.push_back(TransformExpr(sarg.value()));
+		} else if (sarg.has_enum_()) {
+			// Enum arguments (like for EXTRACT function)
+			// We'll handle these specially
+			auto enum_val = sarg.enum_();
+			children.push_back(make_uniq<ConstantExpression>(Value(enum_val)));
+		} else {
+			throw NotImplementedException("Unsupported scalar function argument type");
+		}
+	}
+
+	// Handle special functions that map to operators
+	if (function_name == "and") {
+		return make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(children));
+	} else if (function_name == "or") {
+		return make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_OR, std::move(children));
+	} else if (function_name == "lt") {
+		if (children.size() != 2) {
+			throw InvalidInputException("lt function requires exactly 2 arguments");
+		}
+		return make_uniq<ComparisonExpression>(ExpressionType::COMPARE_LESSTHAN,
+		                                       std::move(children[0]), std::move(children[1]));
+	} else if (function_name == "lte") {
+		if (children.size() != 2) {
+			throw InvalidInputException("lte function requires exactly 2 arguments");
+		}
+		return make_uniq<ComparisonExpression>(ExpressionType::COMPARE_LESSTHANOREQUALTO,
+		                                       std::move(children[0]), std::move(children[1]));
+	} else if (function_name == "gt") {
+		if (children.size() != 2) {
+			throw InvalidInputException("gt function requires exactly 2 arguments");
+		}
+		return make_uniq<ComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN,
+		                                       std::move(children[0]), std::move(children[1]));
+	} else if (function_name == "gte") {
+		if (children.size() != 2) {
+			throw InvalidInputException("gte function requires exactly 2 arguments");
+		}
+		return make_uniq<ComparisonExpression>(ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+		                                       std::move(children[0]), std::move(children[1]));
+	} else if (function_name == "equal") {
+		if (children.size() != 2) {
+			throw InvalidInputException("equal function requires exactly 2 arguments");
+		}
+		return make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+		                                       std::move(children[0]), std::move(children[1]));
+	} else if (function_name == "not_equal") {
+		if (children.size() != 2) {
+			throw InvalidInputException("not_equal function requires exactly 2 arguments");
+		}
+		return make_uniq<ComparisonExpression>(ExpressionType::COMPARE_NOTEQUAL,
+		                                       std::move(children[0]), std::move(children[1]));
+	} else if (function_name == "is_null") {
+		if (children.size() != 1) {
+			throw InvalidInputException("is_null function requires exactly 1 argument");
+		}
+		return make_uniq<OperatorExpression>(ExpressionType::OPERATOR_IS_NULL, std::move(children[0]));
+	} else if (function_name == "is_not_null") {
+		if (children.size() != 1) {
+			throw InvalidInputException("is_not_null function requires exactly 1 argument");
+		}
+		return make_uniq<OperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL, std::move(children[0]));
+	} else if (function_name == "not") {
+		if (children.size() != 1) {
+			throw InvalidInputException("not function requires exactly 1 argument");
+		}
+		return make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(children[0]));
+	} else if (function_name == "is_not_distinct_from") {
+		if (children.size() != 2) {
+			throw InvalidInputException("is_not_distinct_from function requires exactly 2 arguments");
+		}
+		return make_uniq<ComparisonExpression>(ExpressionType::COMPARE_NOT_DISTINCT_FROM,
+		                                       std::move(children[0]), std::move(children[1]));
+	}
+
+	// For all other functions, create a FunctionExpression
+	return make_uniq<FunctionExpression>(function_name, std::move(children));
+}
+
+LogicalType SubstraitToAST::SubstraitToDuckType(const substrait::Type &s_type) {
+	switch (s_type.kind_case()) {
+	case substrait::Type::KindCase::kBool:
+		return {LogicalTypeId::BOOLEAN};
+	case substrait::Type::KindCase::kI8:
+		return {LogicalTypeId::TINYINT};
+	case substrait::Type::KindCase::kI16:
+		return {LogicalTypeId::SMALLINT};
+	case substrait::Type::KindCase::kI32:
+		return {LogicalTypeId::INTEGER};
+	case substrait::Type::KindCase::kI64:
+		return {LogicalTypeId::BIGINT};
+	case substrait::Type::KindCase::kDecimal: {
+		auto &s_decimal_type = s_type.decimal();
+		return LogicalType::DECIMAL(s_decimal_type.precision(), s_decimal_type.scale());
+	}
+	case substrait::Type::KindCase::kDate:
+		return {LogicalTypeId::DATE};
+	case substrait::Type::KindCase::kTime:
+		return {LogicalTypeId::TIME};
+	case substrait::Type::KindCase::kVarchar:
+	case substrait::Type::KindCase::kString:
+		return {LogicalTypeId::VARCHAR};
+	case substrait::Type::KindCase::kBinary:
+		return {LogicalTypeId::BLOB};
+	case substrait::Type::KindCase::kFp32:
+		return {LogicalTypeId::FLOAT};
+	case substrait::Type::KindCase::kFp64:
+		return {LogicalTypeId::DOUBLE};
+	case substrait::Type::KindCase::kTimestamp:
+		return {LogicalTypeId::TIMESTAMP};
+	case substrait::Type::KindCase::kList: {
+		auto &s_list_type = s_type.list();
+		auto element_type = SubstraitToDuckType(s_list_type.type());
+		return LogicalType::LIST(element_type);
+	}
+	case substrait::Type::KindCase::kMap: {
+		auto &s_map_type = s_type.map();
+		auto key_type = SubstraitToDuckType(s_map_type.key());
+		auto value_type = SubstraitToDuckType(s_map_type.value());
+		return LogicalType::MAP(key_type, value_type);
+	}
+	case substrait::Type::KindCase::kStruct: {
+		auto &s_struct_type = s_type.struct_();
+		child_list_t<LogicalType> children;
+
+		for (idx_t i = 0; i < (idx_t)s_struct_type.types_size(); i++) {
+			auto field_name = "f" + std::to_string(i);
+			auto field_type = SubstraitToDuckType(s_struct_type.types((int)i));
+			children.push_back(make_pair(field_name, field_type));
+		}
+
+		return LogicalType::STRUCT(children);
+	}
+	case substrait::Type::KindCase::kUuid:
+		return {LogicalTypeId::UUID};
+	case substrait::Type::KindCase::kIntervalDay:
+		return {LogicalTypeId::INTERVAL};
+	default:
+		throw NotImplementedException("Substrait type not yet supported: %s",
+		                              substrait::Type::GetDescriptor()->FindFieldByNumber(s_type.kind_case())->name());
+	}
+}
+
+unique_ptr<ParsedExpression> SubstraitToAST::TransformCastExpr(const substrait::Expression &sexpr) {
+	const auto &scast = sexpr.cast();
+	auto cast_type = SubstraitToDuckType(scast.type());
+	auto cast_child = TransformExpr(scast.input());
+	return make_uniq<CastExpression>(cast_type, std::move(cast_child));
+}
+
+unique_ptr<ParsedExpression> SubstraitToAST::TransformIfThenExpr(const substrait::Expression &sexpr) {
+	// Transform CASE/WHEN statements
+	const auto &scase = sexpr.if_then();
+	auto dcase = make_uniq<CaseExpression>();
+
+	// Transform each WHEN/THEN pair
+	for (const auto &sif : scase.ifs()) {
+		CaseCheck dif;
+		dif.when_expr = TransformExpr(sif.if_());
+		dif.then_expr = TransformExpr(sif.then());
+		dcase->case_checks.push_back(std::move(dif));
+	}
+
+	// Transform ELSE clause
+	dcase->else_expr = TransformExpr(scase.else_());
+
+	return std::move(dcase);
+}
+
+unique_ptr<ParsedExpression> SubstraitToAST::TransformInExpr(const substrait::Expression &sexpr) {
+	// Transform IN operations (e.g., x IN (1, 2, 3))
+	const auto &substrait_in = sexpr.singular_or_list();
+
+	// First value is the left side of IN, rest are the options
+	vector<unique_ptr<ParsedExpression>> values;
+	values.emplace_back(TransformExpr(substrait_in.value()));
+
+	// Add all options from the IN list
+	for (int32_t i = 0; i < substrait_in.options_size(); i++) {
+		values.emplace_back(TransformExpr(substrait_in.options(i)));
+	}
+
+	return make_uniq<OperatorExpression>(ExpressionType::COMPARE_IN, std::move(values));
+}
+
+unique_ptr<ParsedExpression> SubstraitToAST::TransformNested(const substrait::Expression &sexpr) {
+	// Transform nested structures: STRUCT, LIST, MAP
+	auto &nested_expression = sexpr.nested();
+
+	if (nested_expression.has_struct_()) {
+		// STRUCT constructor (e.g., {'key': 'value', 'num': 42})
+		auto &struct_expression = nested_expression.struct_();
+		vector<unique_ptr<ParsedExpression>> children;
+		for (auto &child : struct_expression.fields()) {
+			children.emplace_back(TransformExpr(child));
+		}
+		// Use 'row' function for struct construction
+		return make_uniq<FunctionExpression>("row", std::move(children));
+
+	} else if (nested_expression.has_list()) {
+		// LIST constructor (e.g., [1, 2, 3])
+		auto &list_expression = nested_expression.list();
+		vector<unique_ptr<ParsedExpression>> children;
+		for (auto &child : list_expression.values()) {
+			children.emplace_back(TransformExpr(child));
+		}
+		return make_uniq<FunctionExpression>("list_value", std::move(children));
+
+	} else if (nested_expression.has_map()) {
+		// MAP constructor (e.g., MAP(['k1', 'k2'], [1, 2]))
+		auto &map_expression = nested_expression.map();
+		vector<unique_ptr<ParsedExpression>> children;
+		for (auto &key_value_pair : map_expression.key_values()) {
+			children.emplace_back(TransformExpr(key_value_pair.key()));
+			children.emplace_back(TransformExpr(key_value_pair.value()));
+		}
+		return make_uniq<FunctionExpression>("map", std::move(children));
+
+	} else {
+		throw NotImplementedException("Unsupported nested expression type");
+	}
+}
+
 unique_ptr<ParsedExpression> SubstraitToAST::TransformExpr(const substrait::Expression &sexpr) {
 	switch (sexpr.rex_type_case()) {
 	case substrait::Expression::RexTypeCase::kLiteral:
 		return TransformLiteralExpr(sexpr);
+	case substrait::Expression::RexTypeCase::kSelection:
+		return TransformSelectionExpr(sexpr);
+	case substrait::Expression::RexTypeCase::kScalarFunction:
+		return TransformScalarFunctionExpr(sexpr);
+	case substrait::Expression::RexTypeCase::kCast:
+		return TransformCastExpr(sexpr);
+	case substrait::Expression::RexTypeCase::kIfThen:
+		return TransformIfThenExpr(sexpr);
+	case substrait::Expression::RexTypeCase::kSingularOrList:
+		return TransformInExpr(sexpr);
+	case substrait::Expression::RexTypeCase::kNested:
+		return TransformNested(sexpr);
 	default:
 		throw NotImplementedException(
 		    "Expression type not yet implemented in AST transformer: %s",
@@ -76,8 +413,25 @@ unique_ptr<ParsedExpression> SubstraitToAST::TransformExpr(const substrait::Expr
 	}
 }
 
-unique_ptr<TableRef> SubstraitToAST::TransformReadOp(const substrait::Rel &sop) {
+unique_ptr<TableRef> SubstraitToAST::TransformReadOp(const substrait::Rel &sop,
+                                                      unique_ptr<ParsedExpression> *filter_out,
+                                                      ReadProjectionInfo *projection_info) {
 	auto &sget = sop.read();
+
+	// Extract filter if present (will be added as WHERE clause by caller)
+	if (filter_out && sget.has_filter()) {
+		*filter_out = TransformExpr(sget.filter());
+	}
+
+	// Extract projection mapping if present
+	if (projection_info && sget.has_projection()) {
+		projection_info->has_projection = true;
+		for (auto &sproj : sget.projection().select().struct_items()) {
+			projection_info->field_mapping.push_back(sproj.field());
+		}
+	}
+
+	unique_ptr<TableRef> base_ref;
 
 	if (sget.has_virtual_table()) {
 		// Handle VALUES clause (e.g., SELECT 1)
@@ -96,42 +450,722 @@ unique_ptr<TableRef> SubstraitToAST::TransformReadOp(const substrait::Rel &sop) 
 			}
 
 			values_ref->alias = "values";
-			return unique_ptr<TableRef>(values_ref.release());
+			base_ref = unique_ptr<TableRef>(values_ref.release());
+		} else {
+			throw NotImplementedException("Empty virtual table not supported");
 		}
 	} else if (sget.has_named_table()) {
 		// Handle named tables
-		auto base_ref = make_uniq<BaseTableRef>();
-		base_ref->schema_name = DEFAULT_SCHEMA;
-		base_ref->table_name = sget.named_table().names(0);
-		return unique_ptr<TableRef>(base_ref.release());
+		auto table_ref = make_uniq<BaseTableRef>();
+		table_ref->schema_name = DEFAULT_SCHEMA;
+		table_ref->table_name = sget.named_table().names(0);
+		base_ref = unique_ptr<TableRef>(table_ref.release());
+	} else {
+		throw NotImplementedException("Read operation type not yet supported in AST transformer");
 	}
 
-	throw NotImplementedException("Read operation type not yet supported in AST transformer");
+	return base_ref;
+}
+
+unique_ptr<ParsedExpression> SubstraitToAST::RemapFieldReferences(unique_ptr<ParsedExpression> expr,
+                                                                    const ReadProjectionInfo &projection_info) {
+	if (!projection_info.has_projection) {
+		// No remapping needed
+		return expr;
+	}
+
+	// Recursively remap positional references
+	switch (expr->type) {
+	case ExpressionType::POSITIONAL_REFERENCE: {
+		auto &pos_ref = expr->Cast<PositionalReferenceExpression>();
+		// DuckDB uses 1-based indexing, convert to 0-based for lookup
+		idx_t original_idx = pos_ref.index - 1;
+
+		if (original_idx < projection_info.field_mapping.size()) {
+			// Map through the Read's projection: output field -> base table field
+			idx_t mapped_idx = projection_info.field_mapping[original_idx];
+			// Convert back to 1-based
+			pos_ref.index = mapped_idx + 1;
+		}
+		return expr;
+	}
+	case ExpressionType::COMPARE_EQUAL:
+	case ExpressionType::COMPARE_NOTEQUAL:
+	case ExpressionType::COMPARE_LESSTHAN:
+	case ExpressionType::COMPARE_GREATERTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+	case ExpressionType::COMPARE_NOT_DISTINCT_FROM: {
+		auto &comp = expr->Cast<ComparisonExpression>();
+		comp.left = RemapFieldReferences(std::move(comp.left), projection_info);
+		comp.right = RemapFieldReferences(std::move(comp.right), projection_info);
+		return expr;
+	}
+	case ExpressionType::CONJUNCTION_AND:
+	case ExpressionType::CONJUNCTION_OR: {
+		auto &conj = expr->Cast<ConjunctionExpression>();
+		for (auto &child : conj.children) {
+			child = RemapFieldReferences(std::move(child), projection_info);
+		}
+		return expr;
+	}
+	case ExpressionType::OPERATOR_NOT:
+	case ExpressionType::OPERATOR_IS_NULL:
+	case ExpressionType::OPERATOR_IS_NOT_NULL: {
+		auto &op = expr->Cast<OperatorExpression>();
+		if (!op.children.empty()) {
+			op.children[0] = RemapFieldReferences(std::move(op.children[0]), projection_info);
+		}
+		return expr;
+	}
+	case ExpressionType::FUNCTION: {
+		auto &func = expr->Cast<FunctionExpression>();
+		for (auto &child : func.children) {
+			child = RemapFieldReferences(std::move(child), projection_info);
+		}
+		return expr;
+	}
+	default:
+		// For other expression types (constants, etc.), no remapping needed
+		return expr;
+	}
+}
+
+unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &sop) {
+	auto &sagg = sop.aggregate();
+	auto select_node = make_uniq<SelectNode>();
+	ReadProjectionInfo projection_info;
+
+	// Transform input relation (the FROM clause)
+	if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
+		select_node->from_table = TransformReadOp(sagg.input(), nullptr, &projection_info);
+	} else if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
+		// Nested aggregate (e.g., in scalar subqueries)
+		// Wrap in RelRoot and transform recursively
+		substrait::RelRoot temp_root;
+		temp_root.mutable_input()->CopyFrom(sagg.input());
+		select_node->from_table = TransformRootOp(temp_root);
+	} else {
+		throw NotImplementedException("Aggregate input type not yet supported: %s",
+		                            substrait::Rel::GetDescriptor()
+		                                ->FindFieldByNumber(sagg.input().rel_type_case())
+		                                ->name());
+	}
+
+	// Transform GROUP BY expressions
+	if (sagg.groupings_size() > 0) {
+		for (auto &sgrp : sagg.groupings()) {
+			for (auto &sgrpexpr : sgrp.grouping_expressions()) {
+				auto group_expr = TransformExpr(sgrpexpr);
+				// Remap field references if Read has projection
+				group_expr = RemapFieldReferences(std::move(group_expr), projection_info);
+				// Add to both select list and group expressions
+				select_node->select_list.push_back(group_expr->Copy());
+				select_node->groups.group_expressions.push_back(std::move(group_expr));
+			}
+		}
+	}
+
+	// Transform aggregate functions (measures)
+	for (auto &smeas : sagg.measures()) {
+		auto &s_aggr_function = smeas.measure();
+
+		// Check for DISTINCT aggregation
+		bool is_distinct = s_aggr_function.invocation() ==
+		                   substrait::AggregateFunction_AggregationInvocation_AGGREGATION_INVOCATION_DISTINCT;
+
+		// Transform aggregate arguments
+		vector<unique_ptr<ParsedExpression>> children;
+		for (auto &sarg : s_aggr_function.arguments()) {
+			if (sarg.has_value()) {
+				auto arg_expr = TransformExpr(sarg.value());
+				// Remap field references if Read has projection
+				arg_expr = RemapFieldReferences(std::move(arg_expr), projection_info);
+				children.push_back(std::move(arg_expr));
+			}
+		}
+
+		// Get function name
+		auto function_name = FindFunction(s_aggr_function.function_reference());
+		function_name = RemoveFunctionExtension(function_name);
+
+		// Special case: count with no arguments becomes count_star
+		if (function_name == "count" && children.empty()) {
+			function_name = "count_star";
+		}
+
+		// Create aggregate function expression
+		auto agg_expr = make_uniq<FunctionExpression>(function_name, std::move(children),
+		                                               nullptr, nullptr, is_distinct);
+		select_node->select_list.push_back(std::move(agg_expr));
+	}
+
+	// Wrap in SelectStatement and SubqueryRef
+	auto select_stmt = make_uniq<SelectStatement>();
+	select_stmt->node = std::move(select_node);
+	return make_uniq<SubqueryRef>(std::move(select_stmt));
+}
+
+// Helper to convert PositionalReferenceExpression to ColumnRefExpression using schema
+unique_ptr<ParsedExpression> SubstraitToAST::ConvertPositionalToColumnRef(unique_ptr<ParsedExpression> expr,
+                                                                           const substrait::NamedStruct &schema) {
+	if (!expr) {
+		return expr;
+	}
+
+	switch (expr->type) {
+	case ExpressionType::POSITIONAL_REFERENCE: {
+		auto &pos_ref = expr->Cast<PositionalReferenceExpression>();
+		// Convert 1-based position to 0-based index
+		idx_t field_idx = pos_ref.index - 1;
+
+		// Get column name from schema
+		if (field_idx < (idx_t)schema.names_size()) {
+			string col_name = schema.names((int)field_idx);
+			return make_uniq<ColumnRefExpression>(col_name);
+		}
+		// If we can't find the name, return original
+		return expr;
+	}
+	case ExpressionType::COMPARE_EQUAL:
+	case ExpressionType::COMPARE_NOTEQUAL:
+	case ExpressionType::COMPARE_LESSTHAN:
+	case ExpressionType::COMPARE_GREATERTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+	case ExpressionType::COMPARE_NOT_DISTINCT_FROM: {
+		auto &comp = expr->Cast<ComparisonExpression>();
+		comp.left = ConvertPositionalToColumnRef(std::move(comp.left), schema);
+		comp.right = ConvertPositionalToColumnRef(std::move(comp.right), schema);
+		return expr;
+	}
+	case ExpressionType::CONJUNCTION_AND:
+	case ExpressionType::CONJUNCTION_OR: {
+		auto &conj = expr->Cast<ConjunctionExpression>();
+		for (auto &child : conj.children) {
+			child = ConvertPositionalToColumnRef(std::move(child), schema);
+		}
+		return expr;
+	}
+	case ExpressionType::OPERATOR_NOT:
+	case ExpressionType::OPERATOR_IS_NULL:
+	case ExpressionType::OPERATOR_IS_NOT_NULL: {
+		auto &op = expr->Cast<OperatorExpression>();
+		if (!op.children.empty()) {
+			op.children[0] = ConvertPositionalToColumnRef(std::move(op.children[0]), schema);
+		}
+		return expr;
+	}
+	case ExpressionType::FUNCTION: {
+		auto &func = expr->Cast<FunctionExpression>();
+		for (auto &child : func.children) {
+			child = ConvertPositionalToColumnRef(std::move(child), schema);
+		}
+		return expr;
+	}
+	case ExpressionType::CAST: {
+		auto &cast = expr->Cast<CastExpression>();
+		cast.child = ConvertPositionalToColumnRef(std::move(cast.child), schema);
+		return expr;
+	}
+	default:
+		// For other expression types (constants, etc.), no conversion needed
+		return expr;
+	}
+}
+
+// Helper function to transform a Read operation for use in joins
+// If the Read has a projection or filter, wraps it in a subquery
+unique_ptr<TableRef> SubstraitToAST::TransformReadForJoin(const substrait::Rel &sop) {
+	auto &sget = sop.read();
+
+	// Check if the Read has a projection or filter
+	bool has_projection = sget.has_projection();
+	bool has_filter = sget.has_filter();
+
+	// DEBUG: Log what we're processing
+	string table_name = sget.has_named_table() ? sget.named_table().names(0) : "unknown";
+	fprintf(stderr, "[DEBUG TransformReadForJoin] Table: %s, has_projection=%d, has_filter=%d\n",
+	        table_name.c_str(), has_projection, has_filter);
+
+	if (!has_projection && !has_filter) {
+		// No projection or filter, just return the base table ref
+		fprintf(stderr, "[DEBUG TransformReadForJoin] No projection/filter, returning base table\n");
+		return TransformReadOp(sop);
+	}
+
+	// Need to create a subquery to handle projection and/or filter
+	auto select_node = make_uniq<SelectNode>();
+
+	// Get the base table (without extracting filter, we'll handle it separately)
+	select_node->from_table = TransformReadOp(sop);
+
+	// Transform and add filter as WHERE clause if present
+	if (has_filter && sget.has_base_schema()) {
+		// Transform the filter and convert positional references to column names
+		auto filter_expr = TransformExpr(sget.filter());
+		fprintf(stderr, "[DEBUG TransformReadForJoin] Filter BEFORE conversion: %s\n", filter_expr->ToString().c_str());
+		fprintf(stderr, "[DEBUG TransformReadForJoin] Schema has %d fields:\n", sget.base_schema().names_size());
+		for (int i = 0; i < sget.base_schema().names_size(); i++) {
+			fprintf(stderr, "[DEBUG TransformReadForJoin]   Field %d: %s\n", i, sget.base_schema().names(i).c_str());
+		}
+		filter_expr = ConvertPositionalToColumnRef(std::move(filter_expr), sget.base_schema());
+		fprintf(stderr, "[DEBUG TransformReadForJoin] Filter AFTER conversion: %s\n", filter_expr->ToString().c_str());
+		select_node->where_clause = std::move(filter_expr);
+	} else if (has_filter) {
+		fprintf(stderr, "[DEBUG TransformReadForJoin] WARNING: Has filter but no base_schema!\n");
+	}
+
+	// Add projected columns to select list using column names from base schema
+	if (has_projection && sget.has_base_schema()) {
+		const auto &projection = sget.projection().select();
+		const auto &schema = sget.base_schema();
+
+		fprintf(stderr, "[DEBUG TransformReadForJoin] Projecting %d columns:\n", projection.struct_items_size());
+		for (int i = 0; i < projection.struct_items_size(); i++) {
+			const auto &item = projection.struct_items(i);
+			idx_t field_idx = item.field();
+
+			// Get column name from base schema
+			if (field_idx < (idx_t)schema.names_size()) {
+				string col_name = schema.names((int)field_idx);
+				fprintf(stderr, "[DEBUG TransformReadForJoin]   Field %d -> %s\n", (int)field_idx, col_name.c_str());
+				select_node->select_list.push_back(make_uniq<ColumnRefExpression>(col_name));
+			} else {
+				// Fallback to positional reference if column name not available
+				fprintf(stderr, "[DEBUG TransformReadForJoin]   Field %d -> positional ref\n", (int)field_idx);
+				select_node->select_list.push_back(make_uniq<PositionalReferenceExpression>(field_idx + 1));
+			}
+		}
+	} else {
+		// No projection, select all columns
+		fprintf(stderr, "[DEBUG TransformReadForJoin] No projection, selecting *\n");
+		select_node->select_list.push_back(make_uniq<StarExpression>());
+	}
+
+	// Wrap in SelectStatement and SubqueryRef with an alias for proper binding
+	auto select_stmt = make_uniq<SelectStatement>();
+	select_stmt->node = std::move(select_node);
+	auto subquery = make_uniq<SubqueryRef>(std::move(select_stmt));
+
+	// Generate a unique alias for the subquery (important for DuckDB binding)
+	static int subquery_counter = 0;
+	subquery->alias = "subquery_" + std::to_string(subquery_counter++);
+	fprintf(stderr, "[DEBUG TransformReadForJoin] Created subquery with alias: %s\n", subquery->alias.c_str());
+
+	return subquery;
+}
+
+unique_ptr<TableRef> SubstraitToAST::TransformJoinOp(const substrait::Rel &sop) {
+	auto &sjoin = sop.join();
+
+	fprintf(stderr, "[DEBUG TransformJoinOp] Starting join transformation\n");
+
+	// Map Substrait join type to DuckDB join type
+	JoinType djointype;
+	switch (sjoin.type()) {
+	case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_INNER:
+		djointype = JoinType::INNER;
+		break;
+	case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_LEFT:
+		djointype = JoinType::LEFT;
+		break;
+	case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_RIGHT:
+		djointype = JoinType::RIGHT;
+		break;
+	case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_LEFT_SINGLE:
+		djointype = JoinType::SINGLE;
+		break;
+	case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_LEFT_SEMI:
+		djointype = JoinType::SEMI;
+		break;
+	case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_OUTER:
+		djointype = JoinType::OUTER;
+		break;
+	case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_LEFT_ANTI:
+		djointype = JoinType::ANTI;
+		break;
+	case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_RIGHT_SEMI:
+		djointype = JoinType::RIGHT_SEMI;
+		break;
+	case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_RIGHT_ANTI:
+		djointype = JoinType::RIGHT_ANTI;
+		break;
+	default:
+		throw NotImplementedException("Unsupported join type: %s",
+		                              substrait::JoinRel::GetDescriptor()->FindFieldByNumber(sjoin.type())->name());
+	}
+
+	// Build the join ref
+	auto join_ref = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	join_ref->type = djointype;
+
+	// Transform left and right inputs
+	// Use TransformReadForJoin for Read operations to handle projections
+	fprintf(stderr, "[DEBUG TransformJoinOp] Transforming LEFT side (type=%d)\n", sjoin.left().rel_type_case());
+	if (sjoin.left().rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
+		join_ref->left = TransformReadForJoin(sjoin.left());
+	} else if (sjoin.left().rel_type_case() == substrait::Rel::RelTypeCase::kJoin) {
+		// Handle nested joins
+		join_ref->left = TransformJoinOp(sjoin.left());
+	} else if (sjoin.left().rel_type_case() == substrait::Rel::RelTypeCase::kProject ||
+	           sjoin.left().rel_type_case() == substrait::Rel::RelTypeCase::kFilter ||
+	           sjoin.left().rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
+		// Handle Project, Filter, or Aggregate operations
+		// Wrap in RelRoot and transform recursively
+		substrait::RelRoot temp_root;
+		temp_root.mutable_input()->CopyFrom(sjoin.left());
+		join_ref->left = TransformRootOp(temp_root);
+	} else {
+		throw NotImplementedException("Join left input type not yet supported: %s",
+		                            substrait::Rel::GetDescriptor()
+		                                ->FindFieldByNumber(sjoin.left().rel_type_case())
+		                                ->name());
+	}
+
+	fprintf(stderr, "[DEBUG TransformJoinOp] Transforming RIGHT side (type=%d)\n", sjoin.right().rel_type_case());
+	if (sjoin.right().rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
+		join_ref->right = TransformReadForJoin(sjoin.right());
+	} else if (sjoin.right().rel_type_case() == substrait::Rel::RelTypeCase::kJoin) {
+		// Handle nested joins
+		join_ref->right = TransformJoinOp(sjoin.right());
+	} else if (sjoin.right().rel_type_case() == substrait::Rel::RelTypeCase::kProject ||
+	           sjoin.right().rel_type_case() == substrait::Rel::RelTypeCase::kFilter ||
+	           sjoin.right().rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
+		// Handle Project, Filter, or Aggregate operations
+		// Wrap in RelRoot and transform recursively
+		substrait::RelRoot temp_root;
+		temp_root.mutable_input()->CopyFrom(sjoin.right());
+		join_ref->right = TransformRootOp(temp_root);
+	} else {
+		throw NotImplementedException("Join right input type not yet supported: %s",
+		                            substrait::Rel::GetDescriptor()
+		                                ->FindFieldByNumber(sjoin.right().rel_type_case())
+		                                ->name());
+	}
+
+	// Transform join condition
+	if (sjoin.has_expression()) {
+		join_ref->condition = TransformExpr(sjoin.expression());
+	}
+
+	return unique_ptr<TableRef>(join_ref.release());
+}
+
+SetOperationType SubstraitToAST::TransformSetOperationType(int32_t setop) {
+	switch (setop) {
+	case substrait::SetRel_SetOp_SET_OP_UNION_ALL:
+		return SetOperationType::UNION;
+	case substrait::SetRel_SetOp_SET_OP_MINUS_PRIMARY:
+		return SetOperationType::EXCEPT;
+	case substrait::SetRel_SetOp_SET_OP_INTERSECTION_PRIMARY:
+		return SetOperationType::INTERSECT;
+	default:
+		throw NotImplementedException("SetOperationType transform not implemented for SetRel_SetOp type %d", setop);
+	}
+}
+
+unique_ptr<TableRef> SubstraitToAST::TransformCrossProductOp(const substrait::Rel &sop) {
+	auto &scross = sop.cross();
+
+	fprintf(stderr, "[DEBUG TransformCrossProductOp] Starting cross product transformation\n");
+
+	// Build a cross join ref (join without condition = Cartesian product)
+	auto join_ref = make_uniq<JoinRef>(JoinRefType::CROSS);
+
+	// Transform left and right inputs
+	fprintf(stderr, "[DEBUG TransformCrossProductOp] Transforming LEFT side (type=%d)\n", scross.left().rel_type_case());
+	if (scross.left().rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
+		join_ref->left = TransformReadForJoin(scross.left());
+	} else {
+		// Handle other relation types by wrapping in RelRoot
+		substrait::RelRoot temp_root;
+		temp_root.mutable_input()->CopyFrom(scross.left());
+		join_ref->left = TransformRootOp(temp_root);
+	}
+
+	fprintf(stderr, "[DEBUG TransformCrossProductOp] Transforming RIGHT side (type=%d)\n", scross.right().rel_type_case());
+	if (scross.right().rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
+		join_ref->right = TransformReadForJoin(scross.right());
+	} else {
+		// Handle other relation types by wrapping in RelRoot
+		substrait::RelRoot temp_root;
+		temp_root.mutable_input()->CopyFrom(scross.right());
+		join_ref->right = TransformRootOp(temp_root);
+	}
+
+	fprintf(stderr, "[DEBUG TransformCrossProductOp] Cross product transformation complete\n");
+	return join_ref;
+}
+
+unique_ptr<TableRef> SubstraitToAST::TransformSetOp(const substrait::Rel &sop) {
+	auto &set = sop.set();
+	auto set_op_type = set.op();
+	auto duck_setop_type = TransformSetOperationType(set_op_type);
+
+	// Check if this is UNION ALL (setop_all = true) or UNION DISTINCT (setop_all = false)
+	// For Substrait, SET_OP_UNION_ALL means ALL modifier is present
+	bool setop_all = (set_op_type == substrait::SetRel_SetOp_SET_OP_UNION_ALL);
+
+	auto input_count = set.inputs_size();
+	if (input_count != 2) {
+		throw NotImplementedException("Set operations with %d inputs not supported (expected 2)", input_count);
+	}
+
+	// Transform left and right inputs recursively
+	substrait::RelRoot left_root;
+	left_root.mutable_input()->CopyFrom(set.inputs(0));
+	auto left_ref = TransformRootOp(left_root);
+
+	substrait::RelRoot right_root;
+	right_root.mutable_input()->CopyFrom(set.inputs(1));
+	auto right_ref = TransformRootOp(right_root);
+
+	// Extract the query nodes from the SubqueryRef wrappers
+	if (!left_ref || left_ref->type != TableReferenceType::SUBQUERY) {
+		throw InternalException("Expected SubqueryRef for left input of set operation");
+	}
+	if (!right_ref || right_ref->type != TableReferenceType::SUBQUERY) {
+		throw InternalException("Expected SubqueryRef for right input of set operation");
+	}
+
+	auto &left_subquery = left_ref->Cast<SubqueryRef>();
+	auto &right_subquery = right_ref->Cast<SubqueryRef>();
+
+	// Create the SetOperationNode
+	auto setop_node = make_uniq<SetOperationNode>();
+	setop_node->setop_type = duck_setop_type;
+	setop_node->setop_all = setop_all;
+	setop_node->left = std::move(left_subquery.subquery->node);
+	setop_node->right = std::move(right_subquery.subquery->node);
+
+	// Wrap in SelectStatement and SubqueryRef
+	auto select_stmt = make_uniq<SelectStatement>();
+	select_stmt->node = std::move(setop_node);
+
+	return make_uniq<SubqueryRef>(std::move(select_stmt));
+}
+
+OrderByNode SubstraitToAST::TransformOrder(const substrait::SortField &sordf) {
+	OrderType dordertype;
+	OrderByNullType dnullorder;
+
+	switch (sordf.direction()) {
+	case substrait::SortField_SortDirection_SORT_DIRECTION_ASC_NULLS_FIRST:
+		dordertype = OrderType::ASCENDING;
+		dnullorder = OrderByNullType::NULLS_FIRST;
+		break;
+	case substrait::SortField_SortDirection_SORT_DIRECTION_ASC_NULLS_LAST:
+		dordertype = OrderType::ASCENDING;
+		dnullorder = OrderByNullType::NULLS_LAST;
+		break;
+	case substrait::SortField_SortDirection_SORT_DIRECTION_DESC_NULLS_FIRST:
+		dordertype = OrderType::DESCENDING;
+		dnullorder = OrderByNullType::NULLS_FIRST;
+		break;
+	case substrait::SortField_SortDirection_SORT_DIRECTION_DESC_NULLS_LAST:
+		dordertype = OrderType::DESCENDING;
+		dnullorder = OrderByNullType::NULLS_LAST;
+		break;
+	default:
+		throw NotImplementedException(
+		    "Unsupported ordering %s",
+		    substrait::SortField::GetDescriptor()->FindFieldByNumber(sordf.direction())->name());
+	}
+
+	return {dordertype, dnullorder, TransformExpr(sordf.expr())};
 }
 
 unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &sop) {
-	// For now, just transform the input relation
+	fprintf(stderr, "[DEBUG TransformRootOp] ENTRY - input rel_type_case=%d\n", sop.input().rel_type_case());
 	auto &input = sop.input();
 
-	if (input.rel_type_case() == substrait::Rel::RelTypeCase::kProject) {
-		auto &project = input.project();
+	// Extract top-level modifiers (Sort, Fetch) by unwrapping them
+	vector<unique_ptr<ResultModifier>> modifiers;
+	const substrait::Rel *current_rel = &input;
+
+	// Process Sort and Fetch operations at the top level
+	while (true) {
+		if (current_rel->rel_type_case() == substrait::Rel::RelTypeCase::kSort) {
+			// Extract ORDER BY
+			auto order_modifier = make_uniq<OrderModifier>();
+			for (auto &sordf : current_rel->sort().sorts()) {
+				order_modifier->orders.push_back(TransformOrder(sordf));
+			}
+			modifiers.push_back(std::move(order_modifier));
+			current_rel = &current_rel->sort().input();
+		} else if (current_rel->rel_type_case() == substrait::Rel::RelTypeCase::kFetch) {
+			// Extract LIMIT and OFFSET
+			auto limit_modifier = make_uniq<LimitModifier>();
+			auto &fetch = current_rel->fetch();
+
+			// Handle limit (-1 means no limit)
+			if (fetch.count() != -1) {
+				limit_modifier->limit = make_uniq<ConstantExpression>(Value::BIGINT(fetch.count()));
+			}
+
+			// Handle offset
+			if (fetch.offset() > 0) {
+				limit_modifier->offset = make_uniq<ConstantExpression>(Value::BIGINT(fetch.offset()));
+			}
+
+			modifiers.push_back(std::move(limit_modifier));
+			current_rel = &current_rel->fetch().input();
+		} else {
+			// No more Sort/Fetch operations to unwrap
+			break;
+		}
+	}
+
+	// Now process the remaining relation (Project, Filter, Read, etc.)
+	fprintf(stderr, "[DEBUG TransformRootOp] After unwrap loop, current_rel type=%d\n", current_rel->rel_type_case());
+	unique_ptr<SelectNode> select_node;
+
+	// Handle different relation types
+	fprintf(stderr, "[DEBUG TransformRootOp] Checking kProject: current=%d, kProject=%d\n",
+	        current_rel->rel_type_case(), (int)substrait::Rel::RelTypeCase::kProject);
+	if (current_rel->rel_type_case() == substrait::Rel::RelTypeCase::kProject) {
+		auto &project = current_rel->project();
 		auto &project_input = project.input();
 
-		// Get the base table/values
-		unique_ptr<TableRef> from_table;
+		// Build SELECT node
+		select_node = make_uniq<SelectNode>();
+		unique_ptr<ParsedExpression> filter_expr;
+		ReadProjectionInfo projection_info;
+
+		// Handle the input to the projection
+		fprintf(stderr, "[DEBUG TransformRootOp] Project input rel_type_case=%d\n", project_input.rel_type_case());
 		if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
-			from_table = TransformReadOp(project_input);
+			// Simple: Project → Read (possibly with embedded filter and projection)
+			fprintf(stderr, "[DEBUG TransformRootOp] Handling Project → Read\n");
+			select_node->from_table = TransformReadOp(project_input, &filter_expr, &projection_info);
+			if (filter_expr) {
+				// Convert positional references to column names for proper binding
+				auto &read_input = project_input.read();
+				if (read_input.has_base_schema()) {
+					filter_expr = ConvertPositionalToColumnRef(std::move(filter_expr), read_input.base_schema());
+				}
+				select_node->where_clause = std::move(filter_expr);
+			}
+		} else if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kFilter) {
+			// Project → Filter → Read
+			fprintf(stderr, "[DEBUG TransformRootOp] Handling Project → Filter → Read\n");
+			auto &filter = project_input.filter();
+			auto &filter_input = filter.input();
+
+			if (filter_input.rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
+				select_node->from_table = TransformReadOp(filter_input, nullptr, &projection_info);
+				// Add WHERE clause and convert positional references to column names
+				auto filter_expr = TransformExpr(filter.condition());
+				fprintf(stderr, "[DEBUG TransformRootOp] Filter BEFORE ConvertPositionalToColumnRef\n");
+				// Convert positional references using the Read's base_schema
+				auto &read_input = filter_input.read();
+				if (read_input.has_base_schema()) {
+					filter_expr = ConvertPositionalToColumnRef(std::move(filter_expr), read_input.base_schema());
+					fprintf(stderr, "[DEBUG TransformRootOp] Filter AFTER ConvertPositionalToColumnRef\n");
+				} else {
+					fprintf(stderr, "[DEBUG TransformRootOp] WARNING: No base_schema available for filter conversion!\n");
+				}
+				select_node->where_clause = std::move(filter_expr);
+			} else {
+				throw NotImplementedException("Filter input type not yet supported: %s",
+				                            substrait::Rel::GetDescriptor()
+				                                ->FindFieldByNumber(filter_input.rel_type_case())
+				                                ->name());
+			}
+		} else if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kJoin) {
+			// Project → Join
+			select_node->from_table = TransformJoinOp(project_input);
+		} else if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
+			// Project → Aggregate (could happen with aggregate queries)
+			select_node->from_table = TransformAggregateOp(project_input);
+		} else if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kProject) {
+			// Project → Project (nested projections)
+			// Handle this by transforming the nested structure recursively
+			// We need to create a temporary RelRoot wrapping the inner project
+			substrait::RelRoot temp_root;
+			temp_root.mutable_input()->CopyFrom(project_input);
+			select_node->from_table = TransformRootOp(temp_root);
 		} else {
-			throw NotImplementedException("Project input type not yet supported");
+			throw NotImplementedException("Project input type not yet supported: %s",
+			                            substrait::Rel::GetDescriptor()
+			                                ->FindFieldByNumber(project_input.rel_type_case())
+			                                ->name());
 		}
 
-		// Build SELECT node
-		auto select_node = make_uniq<SelectNode>();
-		select_node->from_table = std::move(from_table);
+		// Handle Project expressions and emit/outputMapping
+		// In Substrait, a Project combines input columns + computed expressions,
+		// then uses outputMapping to select which to output
+		if (project.has_common() && project.common().has_emit() &&
+		    project.common().emit().output_mapping_size() > 0) {
+			// Has explicit outputMapping - need to build combined pool
+			auto &output_mapping = project.common().emit().output_mapping();
 
-		// Add projections
-		for (auto &sexpr : project.expressions()) {
-			select_node->select_list.push_back(TransformExpr(sexpr));
+			// Transform the computed expressions first
+			vector<unique_ptr<ParsedExpression>> computed_exprs;
+			for (auto &sexpr : project.expressions()) {
+				auto expr = TransformExpr(sexpr);
+				expr = RemapFieldReferences(std::move(expr), projection_info);
+				computed_exprs.push_back(std::move(expr));
+			}
+
+			// Determine the number of input columns from the from_table
+			// The outputMapping refers to: [input_0, ..., input_N-1, expr_0, ..., expr_M-1]
+			idx_t num_inputs = 0;
+
+			// For SubqueryRef, we can inspect the select list to count columns
+			if (select_node->from_table && select_node->from_table->type == TableReferenceType::SUBQUERY) {
+				auto &subquery_ref = select_node->from_table->Cast<SubqueryRef>();
+				if (subquery_ref.subquery && subquery_ref.subquery->node) {
+					auto &query_node = subquery_ref.subquery->node;
+					if (query_node->type == QueryNodeType::SELECT_NODE) {
+						auto &inner_select = query_node->Cast<SelectNode>();
+						num_inputs = inner_select.select_list.size();
+					}
+				}
+			}
+
+			// If we couldn't determine num_inputs from the subquery, fall back to heuristic
+			if (num_inputs == 0) {
+				// Compute based on max(outputMapping) - if it exceeds expression count,
+				// there must be input columns
+				int32_t max_mapping_idx = 0;
+				for (int i = 0; i < output_mapping.size(); i++) {
+					max_mapping_idx = std::max(max_mapping_idx, output_mapping.Get(i));
+				}
+				idx_t num_computed = computed_exprs.size();
+				num_inputs = (max_mapping_idx >= (int32_t)num_computed) ?
+				             (max_mapping_idx - num_computed + 1) : 0;
+			}
+
+			// Build the select list based on outputMapping
+			for (int i = 0; i < output_mapping.size(); i++) {
+				int32_t field_idx = output_mapping.Get(i);
+
+				if ((idx_t)field_idx < num_inputs) {
+					// References an input column (from subquery)
+					select_node->select_list.push_back(make_uniq<PositionalReferenceExpression>(field_idx + 1));
+				} else {
+					// References a computed expression
+					idx_t expr_idx = field_idx - num_inputs;
+					if (expr_idx < computed_exprs.size()) {
+						select_node->select_list.push_back(std::move(computed_exprs[expr_idx]));
+						computed_exprs[expr_idx] = nullptr; // Mark as used
+					}
+				}
+			}
+		} else {
+			// No outputMapping - just use the expressions directly
+			for (auto &sexpr : project.expressions()) {
+				auto expr = TransformExpr(sexpr);
+				expr = RemapFieldReferences(std::move(expr), projection_info);
+				select_node->select_list.push_back(std::move(expr));
+			}
+		}
+
+		// Add modifiers (ORDER BY, LIMIT) to the query node
+		for (auto &modifier : modifiers) {
+			select_node->modifiers.push_back(std::move(modifier));
 		}
 
 		// Wrap in SelectStatement and SubqueryRef
@@ -139,9 +1173,241 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 		select_stmt->node = std::move(select_node);
 
 		return make_uniq<SubqueryRef>(std::move(select_stmt));
+	} else if (current_rel->rel_type_case() == substrait::Rel::RelTypeCase::kFilter) {
+		// Filter can represent WHERE (Filter → Read) or HAVING (Filter → Aggregate)
+		fprintf(stderr, "[DEBUG TransformRootOp] Handling top-level kFilter (kFilter=%d)\n",
+		        (int)substrait::Rel::RelTypeCase::kFilter);
+		auto &filter = current_rel->filter();
+		auto &filter_input = filter.input();
+
+		// Check if this is a HAVING clause (Filter → Aggregate)
+		if (filter_input.rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
+			fprintf(stderr, "[DEBUG kFilter] Detected HAVING clause (Filter → Aggregate)\n");
+
+			// Transform the aggregate operation
+			auto agg_ref = TransformAggregateOp(filter_input);
+
+			// Extract the SelectNode from the aggregate's SubqueryRef
+			auto &agg_subquery = agg_ref->Cast<SubqueryRef>();
+			// The aggregate returns a SubqueryRef with a SelectStatement containing a SelectNode
+			auto *select_stmt_ptr = agg_subquery.subquery.get();
+			auto *stmt = dynamic_cast<SelectStatement*>(select_stmt_ptr);
+			if (!stmt || !stmt->node) {
+				throw InternalException("Expected SelectStatement with SelectNode in aggregate operation");
+			}
+			auto *node_ptr = stmt->node.get();
+			if (!node_ptr || node_ptr->type != QueryNodeType::SELECT_NODE) {
+				throw InternalException("Expected SelectNode in aggregate SelectStatement");
+			}
+			select_node = unique_ptr<SelectNode>((SelectNode*)stmt->node.release());
+
+			// Transform and apply the HAVING condition
+			auto having_expr = TransformExpr(filter.condition());
+			fprintf(stderr, "[DEBUG kFilter] HAVING expression: %s\n", having_expr->ToString().c_str());
+			select_node->having = std::move(having_expr);
+
+			// Add modifiers (ORDER BY, LIMIT) to the query node
+			for (auto &modifier : modifiers) {
+				select_node->modifiers.push_back(std::move(modifier));
+			}
+
+			// Wrap in SelectStatement and SubqueryRef
+			auto new_stmt = make_uniq<SelectStatement>();
+			new_stmt->node = std::move(select_node);
+			return make_uniq<SubqueryRef>(std::move(new_stmt));
+		}
+
+		select_node = make_uniq<SelectNode>();
+
+		// Extract the Read's embedded filter (if it has one)
+		unique_ptr<ParsedExpression> read_filter_expr;
+		if (filter_input.rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
+			select_node->from_table = TransformReadOp(filter_input, &read_filter_expr);
+		} else {
+			throw NotImplementedException("Filter input type not yet supported");
+		}
+
+		// Get the top-level filter expression
+		auto top_filter_expr = TransformExpr(filter.condition());
+		fprintf(stderr, "[DEBUG kFilter] Top-level filter BEFORE conversion: %s\n", top_filter_expr->ToString().c_str());
+
+		// Convert positional references using the Read's base_schema
+		auto &read_input = filter_input.read();
+		if (read_input.has_base_schema()) {
+			fprintf(stderr, "[DEBUG kFilter] Schema has %d fields:\n", read_input.base_schema().names_size());
+			for (int i = 0; i < read_input.base_schema().names_size(); i++) {
+				fprintf(stderr, "[DEBUG kFilter]   Field %d: %s\n", i, read_input.base_schema().names(i).c_str());
+			}
+
+			// Convert top-level filter
+			top_filter_expr = ConvertPositionalToColumnRef(std::move(top_filter_expr), read_input.base_schema());
+			fprintf(stderr, "[DEBUG kFilter] Top-level filter AFTER conversion: %s\n", top_filter_expr->ToString().c_str());
+
+			// Convert Read's embedded filter (if it exists)
+			if (read_filter_expr) {
+				fprintf(stderr, "[DEBUG kFilter] Read embedded filter BEFORE conversion: %s\n", read_filter_expr->ToString().c_str());
+				read_filter_expr = ConvertPositionalToColumnRef(std::move(read_filter_expr), read_input.base_schema());
+				fprintf(stderr, "[DEBUG kFilter] Read embedded filter AFTER conversion: %s\n", read_filter_expr->ToString().c_str());
+			}
+		} else {
+			fprintf(stderr, "[DEBUG kFilter] WARNING: No base_schema available!\n");
+		}
+
+		// Combine both filters with AND if both exist
+		if (read_filter_expr && top_filter_expr) {
+			fprintf(stderr, "[DEBUG kFilter] Combining Read filter AND top-level filter\n");
+			vector<unique_ptr<ParsedExpression>> children;
+			children.push_back(std::move(read_filter_expr));
+			children.push_back(std::move(top_filter_expr));
+			select_node->where_clause = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(children));
+		} else if (read_filter_expr) {
+			fprintf(stderr, "[DEBUG kFilter] Using only Read filter\n");
+			select_node->where_clause = std::move(read_filter_expr);
+		} else if (top_filter_expr) {
+			fprintf(stderr, "[DEBUG kFilter] Using only top-level filter\n");
+			select_node->where_clause = std::move(top_filter_expr);
+		}
+
+		// Add SELECT * for all columns
+		select_node->select_list.push_back(make_uniq<StarExpression>());
+
+		// Add modifiers (ORDER BY, LIMIT) to the query node
+		for (auto &modifier : modifiers) {
+			select_node->modifiers.push_back(std::move(modifier));
+		}
+
+		// Wrap in SelectStatement and SubqueryRef
+		auto select_stmt = make_uniq<SelectStatement>();
+		select_stmt->node = std::move(select_node);
+
+		return make_uniq<SubqueryRef>(std::move(select_stmt));
+	} else if (current_rel->rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
+		// Simple read without filter or custom projection (SELECT * FROM table)
+		select_node = make_uniq<SelectNode>();
+		unique_ptr<ParsedExpression> filter_expr;
+
+		select_node->from_table = TransformReadOp(*current_rel, &filter_expr);
+		if (filter_expr) {
+			select_node->where_clause = std::move(filter_expr);
+		}
+
+		// Add SELECT * for all columns
+		select_node->select_list.push_back(make_uniq<StarExpression>());
+
+		// Add modifiers (ORDER BY, LIMIT) to the query node
+		for (auto &modifier : modifiers) {
+			select_node->modifiers.push_back(std::move(modifier));
+		}
+
+		// Wrap in SelectStatement and SubqueryRef
+		auto select_stmt = make_uniq<SelectStatement>();
+		select_stmt->node = std::move(select_node);
+
+		return make_uniq<SubqueryRef>(std::move(select_stmt));
+	} else if (current_rel->rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
+		// Aggregate operation (GROUP BY with aggregates)
+		auto agg_ref = TransformAggregateOp(*current_rel);
+
+		// If there are modifiers (ORDER BY, LIMIT), we need to wrap this in another SelectNode
+		if (!modifiers.empty()) {
+			select_node = make_uniq<SelectNode>();
+			select_node->from_table = std::move(agg_ref);
+			select_node->select_list.push_back(make_uniq<StarExpression>());
+
+			// Add modifiers
+			for (auto &modifier : modifiers) {
+				select_node->modifiers.push_back(std::move(modifier));
+			}
+
+			auto select_stmt = make_uniq<SelectStatement>();
+			select_stmt->node = std::move(select_node);
+			return make_uniq<SubqueryRef>(std::move(select_stmt));
+		}
+
+		// No modifiers, return aggregate directly
+		return agg_ref;
+	} else if (current_rel->rel_type_case() == substrait::Rel::RelTypeCase::kJoin) {
+		// Join operation
+		auto join_ref = TransformJoinOp(*current_rel);
+
+		// If there are modifiers or we need to project specific columns, wrap in a SelectNode
+		if (!modifiers.empty()) {
+			select_node = make_uniq<SelectNode>();
+			select_node->from_table = std::move(join_ref);
+			select_node->select_list.push_back(make_uniq<StarExpression>());
+
+			// Add modifiers
+			for (auto &modifier : modifiers) {
+				select_node->modifiers.push_back(std::move(modifier));
+			}
+
+			auto select_stmt = make_uniq<SelectStatement>();
+			select_stmt->node = std::move(select_node);
+			return make_uniq<SubqueryRef>(std::move(select_stmt));
+		}
+
+		// No modifiers, wrap join in SelectNode with SELECT *
+		select_node = make_uniq<SelectNode>();
+		select_node->from_table = std::move(join_ref);
+		select_node->select_list.push_back(make_uniq<StarExpression>());
+
+		auto select_stmt = make_uniq<SelectStatement>();
+		select_stmt->node = std::move(select_node);
+		return make_uniq<SubqueryRef>(std::move(select_stmt));
+	} else if (current_rel->rel_type_case() == substrait::Rel::RelTypeCase::kCross) {
+		// Cross product operation
+		auto cross_ref = TransformCrossProductOp(*current_rel);
+
+		// Cross products work like joins - wrap in SelectNode with SELECT *
+		if (!modifiers.empty()) {
+			select_node = make_uniq<SelectNode>();
+			select_node->from_table = std::move(cross_ref);
+			select_node->select_list.push_back(make_uniq<StarExpression>());
+
+			// Add modifiers
+			for (auto &modifier : modifiers) {
+				select_node->modifiers.push_back(std::move(modifier));
+			}
+
+			auto select_stmt = make_uniq<SelectStatement>();
+			select_stmt->node = std::move(select_node);
+			return make_uniq<SubqueryRef>(std::move(select_stmt));
+		}
+
+		// No modifiers, wrap cross product in SelectNode with SELECT *
+		select_node = make_uniq<SelectNode>();
+		select_node->from_table = std::move(cross_ref);
+		select_node->select_list.push_back(make_uniq<StarExpression>());
+
+		auto select_stmt = make_uniq<SelectStatement>();
+		select_stmt->node = std::move(select_node);
+		return make_uniq<SubqueryRef>(std::move(select_stmt));
+	} else if (current_rel->rel_type_case() == substrait::Rel::RelTypeCase::kSet) {
+		// Set operation (UNION, INTERSECT, EXCEPT)
+		auto set_ref = TransformSetOp(*current_rel);
+
+		// If there are modifiers (ORDER BY, LIMIT), wrap in a SelectNode
+		if (!modifiers.empty()) {
+			select_node = make_uniq<SelectNode>();
+			select_node->from_table = std::move(set_ref);
+			select_node->select_list.push_back(make_uniq<StarExpression>());
+
+			// Add modifiers
+			for (auto &modifier : modifiers) {
+				select_node->modifiers.push_back(std::move(modifier));
+			}
+
+			auto select_stmt = make_uniq<SelectStatement>();
+			select_stmt->node = std::move(select_node);
+			return make_uniq<SubqueryRef>(std::move(select_stmt));
+		}
+
+		// No modifiers, return the set operation directly
+		return set_ref;
 	}
 
-	throw NotImplementedException("Root operation type not yet supported in AST transformer");
+	throw NotImplementedException("Root operation type not yet supported: %s",
+	                            substrait::Rel::GetDescriptor()->FindFieldByNumber(current_rel->rel_type_case())->name());
 }
 
 unique_ptr<TableRef> SubstraitToAST::TransformPlanToTableRef() {

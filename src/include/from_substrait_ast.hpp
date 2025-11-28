@@ -30,15 +30,68 @@ public:
 	unique_ptr<TableRef> TransformPlanToTableRef();
 
 private:
+	//! Information about Read projection mapping
+	struct ReadProjectionInfo {
+		bool has_projection = false;
+		vector<idx_t> field_mapping; // Maps output field index to base table field index
+	};
+
 	//! Transforms Substrait Plan Root to a TableRef
 	unique_ptr<TableRef> TransformRootOp(const substrait::RelRoot &sop);
 
 	//! Transform Substrait Read operation to TableRef
-	unique_ptr<TableRef> TransformReadOp(const substrait::Rel &sop);
+	//! If filter_out is provided, any embedded filter will be extracted
+	//! If projection_info is provided, projection mapping information will be returned
+	unique_ptr<TableRef> TransformReadOp(const substrait::Rel &sop,
+	                                     unique_ptr<ParsedExpression> *filter_out = nullptr,
+	                                     ReadProjectionInfo *projection_info = nullptr);
+
+	//! Transform Substrait Read operation for use in joins
+	//! Wraps Read with projection in a subquery to apply the projection
+	unique_ptr<TableRef> TransformReadForJoin(const substrait::Rel &sop);
+
+	//! Transform Substrait Aggregate operation to TableRef
+	unique_ptr<TableRef> TransformAggregateOp(const substrait::Rel &sop);
+
+	//! Transform Substrait Join operation to TableRef
+	unique_ptr<TableRef> TransformJoinOp(const substrait::Rel &sop);
+
+	//! Transform Substrait Cross Product operation to TableRef
+	unique_ptr<TableRef> TransformCrossProductOp(const substrait::Rel &sop);
+
+	//! Transform Substrait Set operation to TableRef
+	unique_ptr<TableRef> TransformSetOp(const substrait::Rel &sop);
+
+	//! Transform Substrait SetOperationType to DuckDB SetOperationType
+	static SetOperationType TransformSetOperationType(int32_t setop);
+
+	//! Transform Substrait Sort field to DuckDB OrderByNode
+	OrderByNode TransformOrder(const substrait::SortField &sordf);
 
 	//! Transform Substrait Expressions to DuckDB ParsedExpressions
 	unique_ptr<ParsedExpression> TransformExpr(const substrait::Expression &sexpr);
 	static unique_ptr<ParsedExpression> TransformLiteralExpr(const substrait::Expression &sexpr);
+	unique_ptr<ParsedExpression> TransformSelectionExpr(const substrait::Expression &sexpr);
+	unique_ptr<ParsedExpression> TransformScalarFunctionExpr(const substrait::Expression &sexpr);
+	unique_ptr<ParsedExpression> TransformCastExpr(const substrait::Expression &sexpr);
+	unique_ptr<ParsedExpression> TransformIfThenExpr(const substrait::Expression &sexpr);
+	unique_ptr<ParsedExpression> TransformInExpr(const substrait::Expression &sexpr);
+	unique_ptr<ParsedExpression> TransformNested(const substrait::Expression &sexpr);
+
+	//! Transform Substrait Type to DuckDB LogicalType
+	static LogicalType SubstraitToDuckType(const substrait::Type &s_type);
+
+	//! Helper to remap field references based on Read projection
+	unique_ptr<ParsedExpression> RemapFieldReferences(unique_ptr<ParsedExpression> expr,
+	                                                    const ReadProjectionInfo &projection_info);
+
+	//! Helper to convert positional references to column references
+	unique_ptr<ParsedExpression> ConvertPositionalToColumnRef(unique_ptr<ParsedExpression> expr,
+	                                                           const substrait::NamedStruct &schema);
+
+	//! Helper functions
+	string FindFunction(uint64_t id);
+	static string RemoveFunctionExtension(const string &function_name);
 
 	//! Transform literal value
 	static Value TransformLiteralToValue(const substrait::Expression_Literal &literal);
