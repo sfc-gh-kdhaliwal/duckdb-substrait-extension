@@ -683,14 +683,8 @@ unique_ptr<TableRef> SubstraitToAST::TransformReadForJoin(const substrait::Rel &
 	bool has_projection = sget.has_projection();
 	bool has_filter = sget.has_filter();
 
-	// DEBUG: Log what we're processing
-	string table_name = sget.has_named_table() ? sget.named_table().names(0) : "unknown";
-	fprintf(stderr, "[DEBUG TransformReadForJoin] Table: %s, has_projection=%d, has_filter=%d\n",
-	        table_name.c_str(), has_projection, has_filter);
-
 	if (!has_projection && !has_filter) {
 		// No projection or filter, just return the base table ref
-		fprintf(stderr, "[DEBUG TransformReadForJoin] No projection/filter, returning base table\n");
 		return TransformReadOp(sop);
 	}
 
@@ -704,16 +698,8 @@ unique_ptr<TableRef> SubstraitToAST::TransformReadForJoin(const substrait::Rel &
 	if (has_filter && sget.has_base_schema()) {
 		// Transform the filter and convert positional references to column names
 		auto filter_expr = TransformExpr(sget.filter());
-		fprintf(stderr, "[DEBUG TransformReadForJoin] Filter BEFORE conversion: %s\n", filter_expr->ToString().c_str());
-		fprintf(stderr, "[DEBUG TransformReadForJoin] Schema has %d fields:\n", sget.base_schema().names_size());
-		for (int i = 0; i < sget.base_schema().names_size(); i++) {
-			fprintf(stderr, "[DEBUG TransformReadForJoin]   Field %d: %s\n", i, sget.base_schema().names(i).c_str());
-		}
 		filter_expr = ConvertPositionalToColumnRef(std::move(filter_expr), sget.base_schema());
-		fprintf(stderr, "[DEBUG TransformReadForJoin] Filter AFTER conversion: %s\n", filter_expr->ToString().c_str());
 		select_node->where_clause = std::move(filter_expr);
-	} else if (has_filter) {
-		fprintf(stderr, "[DEBUG TransformReadForJoin] WARNING: Has filter but no base_schema!\n");
 	}
 
 	// Add projected columns to select list using column names from base schema
@@ -721,7 +707,6 @@ unique_ptr<TableRef> SubstraitToAST::TransformReadForJoin(const substrait::Rel &
 		const auto &projection = sget.projection().select();
 		const auto &schema = sget.base_schema();
 
-		fprintf(stderr, "[DEBUG TransformReadForJoin] Projecting %d columns:\n", projection.struct_items_size());
 		for (int i = 0; i < projection.struct_items_size(); i++) {
 			const auto &item = projection.struct_items(i);
 			idx_t field_idx = item.field();
@@ -729,17 +714,14 @@ unique_ptr<TableRef> SubstraitToAST::TransformReadForJoin(const substrait::Rel &
 			// Get column name from base schema
 			if (field_idx < (idx_t)schema.names_size()) {
 				string col_name = schema.names((int)field_idx);
-				fprintf(stderr, "[DEBUG TransformReadForJoin]   Field %d -> %s\n", (int)field_idx, col_name.c_str());
 				select_node->select_list.push_back(make_uniq<ColumnRefExpression>(col_name));
 			} else {
 				// Fallback to positional reference if column name not available
-				fprintf(stderr, "[DEBUG TransformReadForJoin]   Field %d -> positional ref\n", (int)field_idx);
 				select_node->select_list.push_back(make_uniq<PositionalReferenceExpression>(field_idx + 1));
 			}
 		}
 	} else {
 		// No projection, select all columns
-		fprintf(stderr, "[DEBUG TransformReadForJoin] No projection, selecting *\n");
 		select_node->select_list.push_back(make_uniq<StarExpression>());
 	}
 
@@ -751,15 +733,12 @@ unique_ptr<TableRef> SubstraitToAST::TransformReadForJoin(const substrait::Rel &
 	// Generate a unique alias for the subquery (important for DuckDB binding)
 	static int subquery_counter = 0;
 	subquery->alias = "subquery_" + std::to_string(subquery_counter++);
-	fprintf(stderr, "[DEBUG TransformReadForJoin] Created subquery with alias: %s\n", subquery->alias.c_str());
 
-	return subquery;
+	return std::move(subquery);
 }
 
 unique_ptr<TableRef> SubstraitToAST::TransformJoinOp(const substrait::Rel &sop) {
 	auto &sjoin = sop.join();
-
-	fprintf(stderr, "[DEBUG TransformJoinOp] Starting join transformation\n");
 
 	// Map Substrait join type to DuckDB join type
 	JoinType djointype;
@@ -802,7 +781,6 @@ unique_ptr<TableRef> SubstraitToAST::TransformJoinOp(const substrait::Rel &sop) 
 
 	// Transform left and right inputs
 	// Use TransformReadForJoin for Read operations to handle projections
-	fprintf(stderr, "[DEBUG TransformJoinOp] Transforming LEFT side (type=%d)\n", sjoin.left().rel_type_case());
 	if (sjoin.left().rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
 		join_ref->left = TransformReadForJoin(sjoin.left());
 	} else if (sjoin.left().rel_type_case() == substrait::Rel::RelTypeCase::kJoin) {
@@ -823,7 +801,6 @@ unique_ptr<TableRef> SubstraitToAST::TransformJoinOp(const substrait::Rel &sop) 
 		                                ->name());
 	}
 
-	fprintf(stderr, "[DEBUG TransformJoinOp] Transforming RIGHT side (type=%d)\n", sjoin.right().rel_type_case());
 	if (sjoin.right().rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
 		join_ref->right = TransformReadForJoin(sjoin.right());
 	} else if (sjoin.right().rel_type_case() == substrait::Rel::RelTypeCase::kJoin) {
@@ -868,13 +845,10 @@ SetOperationType SubstraitToAST::TransformSetOperationType(int32_t setop) {
 unique_ptr<TableRef> SubstraitToAST::TransformCrossProductOp(const substrait::Rel &sop) {
 	auto &scross = sop.cross();
 
-	fprintf(stderr, "[DEBUG TransformCrossProductOp] Starting cross product transformation\n");
-
 	// Build a cross join ref (join without condition = Cartesian product)
 	auto join_ref = make_uniq<JoinRef>(JoinRefType::CROSS);
 
 	// Transform left and right inputs
-	fprintf(stderr, "[DEBUG TransformCrossProductOp] Transforming LEFT side (type=%d)\n", scross.left().rel_type_case());
 	if (scross.left().rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
 		join_ref->left = TransformReadForJoin(scross.left());
 	} else {
@@ -884,7 +858,6 @@ unique_ptr<TableRef> SubstraitToAST::TransformCrossProductOp(const substrait::Re
 		join_ref->left = TransformRootOp(temp_root);
 	}
 
-	fprintf(stderr, "[DEBUG TransformCrossProductOp] Transforming RIGHT side (type=%d)\n", scross.right().rel_type_case());
 	if (scross.right().rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
 		join_ref->right = TransformReadForJoin(scross.right());
 	} else {
@@ -894,8 +867,7 @@ unique_ptr<TableRef> SubstraitToAST::TransformCrossProductOp(const substrait::Re
 		join_ref->right = TransformRootOp(temp_root);
 	}
 
-	fprintf(stderr, "[DEBUG TransformCrossProductOp] Cross product transformation complete\n");
-	return join_ref;
+	return std::move(join_ref);
 }
 
 unique_ptr<TableRef> SubstraitToAST::TransformSetOp(const substrait::Rel &sop) {
@@ -977,7 +949,6 @@ OrderByNode SubstraitToAST::TransformOrder(const substrait::SortField &sordf) {
 }
 
 unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &sop) {
-	fprintf(stderr, "[DEBUG TransformRootOp] ENTRY - input rel_type_case=%d\n", sop.input().rel_type_case());
 	auto &input = sop.input();
 
 	// Extract top-level modifiers (Sort, Fetch) by unwrapping them
@@ -1018,12 +989,9 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 	}
 
 	// Now process the remaining relation (Project, Filter, Read, etc.)
-	fprintf(stderr, "[DEBUG TransformRootOp] After unwrap loop, current_rel type=%d\n", current_rel->rel_type_case());
 	unique_ptr<SelectNode> select_node;
 
 	// Handle different relation types
-	fprintf(stderr, "[DEBUG TransformRootOp] Checking kProject: current=%d, kProject=%d\n",
-	        current_rel->rel_type_case(), (int)substrait::Rel::RelTypeCase::kProject);
 	if (current_rel->rel_type_case() == substrait::Rel::RelTypeCase::kProject) {
 		auto &project = current_rel->project();
 		auto &project_input = project.input();
@@ -1034,10 +1002,8 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 		ReadProjectionInfo projection_info;
 
 		// Handle the input to the projection
-		fprintf(stderr, "[DEBUG TransformRootOp] Project input rel_type_case=%d\n", project_input.rel_type_case());
 		if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
 			// Simple: Project → Read (possibly with embedded filter and projection)
-			fprintf(stderr, "[DEBUG TransformRootOp] Handling Project → Read\n");
 			select_node->from_table = TransformReadOp(project_input, &filter_expr, &projection_info);
 			if (filter_expr) {
 				// Convert positional references to column names for proper binding
@@ -1049,7 +1015,6 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 			}
 		} else if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kFilter) {
 			// Project → Filter → Read
-			fprintf(stderr, "[DEBUG TransformRootOp] Handling Project → Filter → Read\n");
 			auto &filter = project_input.filter();
 			auto &filter_input = filter.input();
 
@@ -1057,14 +1022,10 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 				select_node->from_table = TransformReadOp(filter_input, nullptr, &projection_info);
 				// Add WHERE clause and convert positional references to column names
 				auto filter_expr = TransformExpr(filter.condition());
-				fprintf(stderr, "[DEBUG TransformRootOp] Filter BEFORE ConvertPositionalToColumnRef\n");
 				// Convert positional references using the Read's base_schema
 				auto &read_input = filter_input.read();
 				if (read_input.has_base_schema()) {
 					filter_expr = ConvertPositionalToColumnRef(std::move(filter_expr), read_input.base_schema());
-					fprintf(stderr, "[DEBUG TransformRootOp] Filter AFTER ConvertPositionalToColumnRef\n");
-				} else {
-					fprintf(stderr, "[DEBUG TransformRootOp] WARNING: No base_schema available for filter conversion!\n");
 				}
 				select_node->where_clause = std::move(filter_expr);
 			} else {
@@ -1175,14 +1136,11 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 		return make_uniq<SubqueryRef>(std::move(select_stmt));
 	} else if (current_rel->rel_type_case() == substrait::Rel::RelTypeCase::kFilter) {
 		// Filter can represent WHERE (Filter → Read) or HAVING (Filter → Aggregate)
-		fprintf(stderr, "[DEBUG TransformRootOp] Handling top-level kFilter (kFilter=%d)\n",
-		        (int)substrait::Rel::RelTypeCase::kFilter);
 		auto &filter = current_rel->filter();
 		auto &filter_input = filter.input();
 
 		// Check if this is a HAVING clause (Filter → Aggregate)
 		if (filter_input.rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
-			fprintf(stderr, "[DEBUG kFilter] Detected HAVING clause (Filter → Aggregate)\n");
 
 			// Transform the aggregate operation
 			auto agg_ref = TransformAggregateOp(filter_input);
@@ -1203,7 +1161,6 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 
 			// Transform and apply the HAVING condition
 			auto having_expr = TransformExpr(filter.condition());
-			fprintf(stderr, "[DEBUG kFilter] HAVING expression: %s\n", having_expr->ToString().c_str());
 			select_node->having = std::move(having_expr);
 
 			// Add modifiers (ORDER BY, LIMIT) to the query node
@@ -1229,42 +1186,28 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 
 		// Get the top-level filter expression
 		auto top_filter_expr = TransformExpr(filter.condition());
-		fprintf(stderr, "[DEBUG kFilter] Top-level filter BEFORE conversion: %s\n", top_filter_expr->ToString().c_str());
 
 		// Convert positional references using the Read's base_schema
 		auto &read_input = filter_input.read();
 		if (read_input.has_base_schema()) {
-			fprintf(stderr, "[DEBUG kFilter] Schema has %d fields:\n", read_input.base_schema().names_size());
-			for (int i = 0; i < read_input.base_schema().names_size(); i++) {
-				fprintf(stderr, "[DEBUG kFilter]   Field %d: %s\n", i, read_input.base_schema().names(i).c_str());
-			}
-
 			// Convert top-level filter
 			top_filter_expr = ConvertPositionalToColumnRef(std::move(top_filter_expr), read_input.base_schema());
-			fprintf(stderr, "[DEBUG kFilter] Top-level filter AFTER conversion: %s\n", top_filter_expr->ToString().c_str());
 
 			// Convert Read's embedded filter (if it exists)
 			if (read_filter_expr) {
-				fprintf(stderr, "[DEBUG kFilter] Read embedded filter BEFORE conversion: %s\n", read_filter_expr->ToString().c_str());
 				read_filter_expr = ConvertPositionalToColumnRef(std::move(read_filter_expr), read_input.base_schema());
-				fprintf(stderr, "[DEBUG kFilter] Read embedded filter AFTER conversion: %s\n", read_filter_expr->ToString().c_str());
 			}
-		} else {
-			fprintf(stderr, "[DEBUG kFilter] WARNING: No base_schema available!\n");
 		}
 
 		// Combine both filters with AND if both exist
 		if (read_filter_expr && top_filter_expr) {
-			fprintf(stderr, "[DEBUG kFilter] Combining Read filter AND top-level filter\n");
 			vector<unique_ptr<ParsedExpression>> children;
 			children.push_back(std::move(read_filter_expr));
 			children.push_back(std::move(top_filter_expr));
 			select_node->where_clause = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(children));
 		} else if (read_filter_expr) {
-			fprintf(stderr, "[DEBUG kFilter] Using only Read filter\n");
 			select_node->where_clause = std::move(read_filter_expr);
 		} else if (top_filter_expr) {
-			fprintf(stderr, "[DEBUG kFilter] Using only top-level filter\n");
 			select_node->where_clause = std::move(top_filter_expr);
 		}
 

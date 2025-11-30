@@ -1,7 +1,6 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "substrait_extension.hpp"
-#include "from_substrait.hpp"
 #include "from_substrait_ast.hpp"
 #include "to_substrait.hpp"
 
@@ -23,9 +22,6 @@
 #endif
 
 namespace duckdb {
-
-void do_nothing(ClientContext *) {
-}
 
 struct ToSubstraitFunctionData : public TableFunctionData {
 	ToSubstraitFunctionData() = default;
@@ -146,23 +142,13 @@ static unique_ptr<FunctionData> ToJsonBind(ClientContext &context, TableFunction
 	return InitToSubstraitFunctionData(context.config, input);
 }
 
-shared_ptr<Relation> SubstraitPlanToDuckDBRel(shared_ptr<ClientContext> &context, const string &serialized,
-                                              bool json = false, bool acquire_lock = false) {
-	SubstraitToDuckDB transformer_s2d(context, serialized, json, acquire_lock);
-	return transformer_s2d.TransformPlan();
-}
-
 //! This function matches results of substrait plans with direct Duckdb queries
 //! Is only executed when pragma enable_verification = true
-//! IMPORTANT: In DuckDB 1.4+, we cannot create new Connections during active queries
-//! as this triggers deadlocks in the concurrent checkpoint logic.
-//! Instead, we use the existing context to prepare and execute statements.
+//! IMPORTANT: Uses the NEW AST-based implementation (SubstraitToAST) instead of
+//! the old Relation-based implementation, allowing us to remove legacy code.
 static void VerifySubstraitRoundtrip(unique_ptr<LogicalOperator> &query_plan, ClientContext &context,
                                      ToSubstraitFunctionData &data, const string &serialized, bool is_json) {
-	// Use existing context instead of creating new Connections
-	// This avoids the deadlock issue in DuckDB 1.4+
-
-	// Execute the original SQL query using the existing context
+	// Execute the original SQL query
 	auto actual_result = context.Query(data.query, false);
 
 	// Materialize the actual result
@@ -174,29 +160,58 @@ static void VerifySubstraitRoundtrip(unique_ptr<LogicalOperator> &query_plan, Cl
 		actual_materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(actual_result));
 	}
 
-	// Transform Substrait plan back to DuckDB Relation using existing context
-	shared_ptr<ClientContext> c_ptr(&context, do_nothing);
-	auto sub_relation = SubstraitPlanToDuckDBRel(c_ptr, serialized, is_json, false);
-
-	// Execute the Substrait plan using the existing context
-	auto substrait_result = sub_relation->Execute();
-	substrait_result->names = actual_materialized->names;
+	// NEW: Execute Substrait plan using AST-based approach via prepared statement
+	// This is more efficient than string concatenation and avoids nested query parsing issues
 	unique_ptr<MaterializedQueryResult> substrait_materialized;
 
-	if (substrait_result->type == QueryResultType::STREAM_RESULT) {
-		auto &stream_query = substrait_result->Cast<StreamQueryResult>();
+	// IMPORTANT: Temporarily disable verification to prevent infinite recursion
+	bool original_verification_state = context.config.query_verification_enabled;
+	context.config.query_verification_enabled = false;
 
-		substrait_materialized = stream_query.Materialize();
-	} else if (substrait_result->type == QueryResultType::MATERIALIZED_RESULT) {
-		substrait_materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(substrait_result));
+	try {
+		if (is_json) {
+			// Use prepared statement for JSON input
+			auto stmt = context.Prepare("SELECT * FROM from_substrait_json(?)");
+			auto pending = stmt->PendingQuery(Value(serialized));
+			auto substrait_result = pending->Execute();
+
+			if (substrait_result->type == QueryResultType::STREAM_RESULT) {
+				auto &stream_query = substrait_result->Cast<StreamQueryResult>();
+				substrait_materialized = stream_query.Materialize();
+			} else {
+				substrait_materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(substrait_result));
+			}
+		} else {
+			// Use prepared statement for binary blob input (more efficient than hex encoding!)
+			auto stmt = context.Prepare("SELECT * FROM from_substrait(?)");
+			auto pending = stmt->PendingQuery(Value::BLOB(serialized));
+			auto substrait_result = pending->Execute();
+
+			if (substrait_result->type == QueryResultType::STREAM_RESULT) {
+				auto &stream_query = substrait_result->Cast<StreamQueryResult>();
+				substrait_materialized = stream_query.Materialize();
+			} else {
+				substrait_materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(substrait_result));
+			}
+		}
+
+		// Restore verification state
+		context.config.query_verification_enabled = original_verification_state;
+
+	} catch (...) {
+		// Restore verification state on exception
+		context.config.query_verification_enabled = original_verification_state;
+		throw;
 	}
+
+	// Compare results
+	substrait_materialized->names = actual_materialized->names;
 	auto &actual_col_coll = actual_materialized->Collection();
 	auto &subs_col_coll = substrait_materialized->Collection();
 	string error_message;
 	if (!ColumnDataCollection::ResultEquals(actual_col_coll, subs_col_coll, error_message)) {
 		query_plan->Print();
-		sub_relation->Print();
-		Printer::Print(serialized);
+		Printer::Print("Substrait plan verification failed");
 		actual_col_coll.Print();
 		subs_col_coll.Print();
 		throw InternalException("The query result of DuckDB's query plan does not match Substrait : " + error_message);
