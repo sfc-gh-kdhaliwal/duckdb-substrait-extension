@@ -1037,6 +1037,9 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 		} else if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kJoin) {
 			// Project → Join
 			select_node->from_table = TransformJoinOp(project_input);
+	} else if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kCross) {
+		// Project → Cross (cross join/Cartesian product)
+		select_node->from_table = TransformCrossProductOp(project_input);
 		} else if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
 			// Project → Aggregate (could happen with aggregate queries)
 			select_node->from_table = TransformAggregateOp(project_input);
