@@ -1,0 +1,48 @@
+# Build directories
+build/
+output*/
+main/
+test_*/
+transferring/
+
+# DuckDB submodule (will be copied from builder stage instead)
+duckdb/
+
+# Logs
+*.log
+out
+
+# macOS
+.DS_Store
+
+# Documentation (not needed for build)
+*.md
+!CMakeLists.txt
+
+# Test files (optional - remove this line if you need tests in Docker)
+test/
+
+# Git metadata we don't need (keep .git/ and .gitmodules for submodules)
+.github/
+
+# Docker files (don't need inside container)
+Dockerfile*
+.dockerignore
+
+# Build scripts (not needed inside container)
+*.sh
+
+# Temporary files
+*.tmp
+*.temp
+
+# Archives
+*.zip
+*.gz
+*.tar
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
