@@ -1,0 +1,131 @@
+# Multi-stage optimized Dockerfile for faster DuckDB Substrait extension builds
+# Uses layer caching, ccache, and parallel builds
+
+FROM ubuntu:22.04 AS base
+
+# Install dependencies (this layer rarely changes, so it will be cached)
+RUN apt-get update && apt-get install -y \
+    git \
+    cmake \
+    ninja-build \
+    build-essential \
+    libssl-dev \
+    python3 \
+    python3-pip \
+    wget \
+    curl \
+    clang \
+    lld \
+    file \
+    ccache \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure ccache
+ENV PATH="/usr/lib/ccache:${PATH}"
+ENV CCACHE_DIR=/cache/ccache
+ENV CCACHE_COMPRESS=1
+ENV CCACHE_COMPRESSLEVEL=6
+ENV CCACHE_MAXSIZE=2G
+
+# ==============================================================================
+# Stage 2: Build DuckDB (cached per version)
+# ==============================================================================
+FROM base AS duckdb-builder
+
+ARG DUCKDB_VERSION=v1.4.2
+
+WORKDIR /build/duckdb
+
+# Clone and checkout specific DuckDB version
+# Using shallow clone for faster download
+RUN git clone --depth 1 --branch ${DUCKDB_VERSION} \
+    https://github.com/duckdb/duckdb.git . || \
+    (git clone https://github.com/duckdb/duckdb.git . && \
+     git fetch --depth 1 origin ${DUCKDB_VERSION} && \
+     git checkout ${DUCKDB_VERSION})
+
+# Build DuckDB with parallel compilation
+# This layer is cached based on DUCKDB_VERSION
+# Reduce parallel level to avoid OOM on amd64
+ARG BUILD_PARALLEL_LEVEL=2
+RUN --mount=type=cache,target=/cache/ccache \
+    CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_PARALLEL_LEVEL} make release
+
+# ==============================================================================
+# Stage 3: Build Extension (this stage rebuilds when your code changes)
+# ==============================================================================
+FROM base AS extension-builder
+
+ARG DUCKDB_VERSION=v1.4.2
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+WORKDIR /build/duckdb-substrait-extension
+
+# Copy pre-built DuckDB from previous stage (fast, cached per version)
+COPY --from=duckdb-builder /build/duckdb ./duckdb
+
+# Copy all extension files (excluding duckdb/ and build artifacts via .dockerignore)
+# This is done AFTER copying DuckDB to maximize cache hits
+COPY . .
+
+# Initialize other submodules (extension-ci-tools, substrait, etc.)
+# The duckdb submodule is already satisfied by the COPY from duckdb-builder above
+RUN git submodule update --init --recursive extension-ci-tools substrait 2>/dev/null || \
+    git submodule update --init --recursive
+
+# Build the extension with parallel compilation
+# Use cache mount for ccache to speed up incremental builds
+# Skip C tests since test directory is excluded for faster builds
+# Reduce parallel level for amd64 to avoid OOM (can be overridden with --build-arg)
+ARG BUILD_PARALLEL_LEVEL=2
+RUN --mount=type=cache,target=/cache/ccache \
+    SKIP_SUBSTRAIT_C_TESTS=1 CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_PARALLEL_LEVEL} make release
+
+# ==============================================================================
+# Stage 4: Package Extension
+# ==============================================================================
+FROM base AS packager
+
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+WORKDIR /output
+
+# Copy built extension from builder stage
+COPY --from=extension-builder \
+    /build/duckdb-substrait-extension/build/release/extension/substrait/substrait.duckdb_extension \
+    ./
+
+# Create platform-specific compressed package
+RUN if [ "$TARGETOS" = "darwin" ]; then \
+        gzip -c substrait.duckdb_extension > substrait.duckdb_extension.osx_${TARGETARCH}.gz && \
+        echo "osx_${TARGETARCH}" > platform.txt; \
+    else \
+        gzip -c substrait.duckdb_extension > substrait.duckdb_extension.linux_${TARGETARCH}.gz && \
+        echo "linux_${TARGETARCH}" > platform.txt; \
+    fi
+
+# Create copy script with additional information
+RUN echo '#!/bin/bash\n\
+echo "==========================================="\n\
+echo "DuckDB Substrait Extension - Build Complete"\n\
+echo "==========================================="\n\
+cp /output/*.gz /output_mount/ 2>/dev/null || echo "Extension built at: /output/"\n\
+cp /output/platform.txt /output_mount/ 2>/dev/null || true\n\
+echo ""\n\
+echo "Extension files:"\n\
+ls -lh /output/*.gz\n\
+if command -v file &> /dev/null; then\n\
+  echo ""\n\
+  echo "File info:"\n\
+  gunzip -c /output/*.gz | file -\n\
+fi\n\
+echo ""\n\
+if [ -d /cache/ccache ]; then\n\
+  echo "ccache statistics:"\n\
+  ccache -s 2>/dev/null || echo "ccache not available"\n\
+fi' > /output/copy_extension.sh && \
+    chmod +x /output/copy_extension.sh
+
+CMD ["/output/copy_extension.sh"]
