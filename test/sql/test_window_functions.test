@@ -1,0 +1,48 @@
+# name: test/sql/test_window_functions.test
+# description: Test Substrait generation for window functions
+# group: [sql]
+
+# =============================================================================
+# NOTE: Window functions are NOT YET IMPLEMENTED in the Substrait extension.
+# The to_substrait converter does not handle LOGICAL_WINDOW operator type.
+# All tests below are commented out pending implementation.
+# 
+# Required work:
+# 1. Add TransformWindowOp function to to_substrait.cpp
+# 2. Handle LogicalOperatorType::LOGICAL_WINDOW in TransformOp switch
+# 3. Map DuckDB window functions to Substrait ConsistentPartitionWindowRel
+# =============================================================================
+
+require substrait
+
+# Tests to implement once window functions are supported:
+
+# statement ok
+# CALL get_substrait('SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM sales')
+
+# statement ok
+# CALL get_substrait('SELECT id, ROW_NUMBER() OVER (PARTITION BY category ORDER BY id) AS rn FROM sales')
+
+# statement ok
+# CALL get_substrait('SELECT id, RANK() OVER (ORDER BY amount DESC) AS rnk FROM sales')
+
+# statement ok
+# CALL get_substrait('SELECT id, DENSE_RANK() OVER (PARTITION BY category ORDER BY amount DESC) AS drnk FROM sales')
+
+# statement ok
+# CALL get_substrait('SELECT id, LAG(amount, 1) OVER (ORDER BY id) AS prev_amount FROM sales')
+
+# statement ok
+# CALL get_substrait('SELECT id, LEAD(amount, 1) OVER (ORDER BY id) AS next_amount FROM sales')
+
+# statement ok
+# CALL get_substrait('SELECT id, SUM(amount) OVER (PARTITION BY category ORDER BY id) AS running_sum FROM sales')
+
+# statement ok
+# CALL get_substrait('SELECT id, AVG(amount) OVER (PARTITION BY category) AS category_avg FROM sales')
+
+# statement ok
+# CALL get_substrait('SELECT id, FIRST_VALUE(amount) OVER (PARTITION BY category ORDER BY id) AS first_amt FROM sales')
+
+# statement ok
+# CALL get_substrait('SELECT id, SUM(amount) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS moving_sum FROM sales')

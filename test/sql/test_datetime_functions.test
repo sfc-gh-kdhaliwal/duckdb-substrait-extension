@@ -1,0 +1,95 @@
+# name: test/sql/test_datetime_functions.test
+# description: Test Substrait generation for date/time functions
+# group: [sql]
+
+require substrait
+
+# =============================================================================
+# Setup
+# =============================================================================
+
+statement ok
+CREATE TABLE events (id INT, event_date DATE, event_time TIMESTAMP)
+
+statement ok
+INSERT INTO events VALUES 
+    (1, '2024-01-15', '2024-01-15 10:30:00'),
+    (2, '2024-02-20', '2024-02-20 14:45:00'),
+    (3, '2024-03-25', '2024-03-25 09:00:00')
+
+# =============================================================================
+# Test 1: EXTRACT year
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT EXTRACT(year FROM event_date) FROM events')
+
+# =============================================================================
+# Test 2: EXTRACT month and day
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT EXTRACT(month FROM event_date), EXTRACT(day FROM event_date) FROM events')
+
+# =============================================================================
+# Test 3: EXTRACT from timestamp (hour, minute, second)
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT EXTRACT(hour FROM event_time), EXTRACT(minute FROM event_time) FROM events')
+
+# =============================================================================
+# Test 4: DATE_TRUNC
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT DATE_TRUNC(''month'', event_date) FROM events')
+
+# =============================================================================
+# Test 5: Date arithmetic with INTERVAL
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT event_date + INTERVAL 1 DAY FROM events')
+
+# =============================================================================
+# Test 6: Date subtraction
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT event_date - INTERVAL 1 MONTH FROM events')
+
+# =============================================================================
+# Test 7: Date comparison
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT * FROM events WHERE event_date > ''2024-02-01''')
+
+# =============================================================================
+# Test 8: BETWEEN dates
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT * FROM events WHERE event_date BETWEEN ''2024-01-01'' AND ''2024-02-28''')
+
+# =============================================================================
+# Test 9: Date difference
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT event_date - DATE ''2024-01-01'' AS days_diff FROM events')
+
+# =============================================================================
+# Test 10: YEAR, MONTH, DAY functions
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT YEAR(event_date), MONTH(event_date), DAY(event_date) FROM events')
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DROP TABLE events

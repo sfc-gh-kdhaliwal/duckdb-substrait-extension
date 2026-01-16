@@ -1,0 +1,104 @@
+# name: test/sql/test_advanced_subqueries.test
+# description: Test Substrait generation for advanced subquery patterns
+# group: [sql]
+
+require substrait
+
+# =============================================================================
+# Setup
+# =============================================================================
+
+statement ok
+CREATE TABLE orders (order_id INT, customer_id INT, amount INT)
+
+statement ok
+CREATE TABLE customers (customer_id INT, name VARCHAR, region VARCHAR)
+
+statement ok
+INSERT INTO orders VALUES (1, 1, 100), (2, 1, 200), (3, 2, 150), (4, 3, 300)
+
+statement ok
+INSERT INTO customers VALUES (1, 'Alice', 'North'), (2, 'Bob', 'South'), (3, 'Charlie', 'North')
+
+# =============================================================================
+# Test 1: Scalar subquery in SELECT
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT order_id, (SELECT MAX(amount) FROM orders) AS max_amount FROM orders')
+
+# =============================================================================
+# Test 2: Scalar subquery with correlation
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT c.name, (SELECT SUM(o.amount) FROM orders o WHERE o.customer_id = c.customer_id) AS total FROM customers c')
+
+# =============================================================================
+# Test 3: Subquery in WHERE with comparison
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT * FROM orders WHERE amount > (SELECT AVG(amount) FROM orders)')
+
+# =============================================================================
+# Test 4: Subquery with IN
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT * FROM orders WHERE customer_id IN (SELECT customer_id FROM customers WHERE region = ''North'')')
+
+# =============================================================================
+# Test 5: EXISTS subquery (correlated)
+# SKIP: Correlated EXISTS creates DELIM_JOIN which is not yet supported
+# =============================================================================
+
+# statement ok
+# CALL get_substrait('SELECT c.name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.customer_id AND o.amount > 100)')
+
+# =============================================================================
+# Test 6: NOT EXISTS subquery (correlated)
+# SKIP: Correlated NOT EXISTS creates DELIM_JOIN which is not yet supported
+# =============================================================================
+
+# statement ok
+# CALL get_substrait('SELECT c.name FROM customers c WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.customer_id)')
+
+# =============================================================================
+# Test 7: Subquery in FROM clause
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT sub.customer_id, sub.total FROM (SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id) sub WHERE sub.total > 200')
+
+# =============================================================================
+# Test 8: Nested subqueries (2 levels)
+# SKIP: DISTINCT with PROJECTION child not yet supported
+# =============================================================================
+
+# statement ok
+# CALL get_substrait('SELECT * FROM orders WHERE customer_id IN (SELECT customer_id FROM customers WHERE region IN (SELECT DISTINCT region FROM customers WHERE customer_id = 1))')
+
+# =============================================================================
+# Test 9: Subquery in HAVING clause
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id HAVING SUM(amount) > (SELECT AVG(amount) FROM orders)')
+
+# =============================================================================
+# Test 10: Correlated subquery with multiple conditions
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT o1.order_id FROM orders o1 WHERE o1.amount > (SELECT AVG(o2.amount) FROM orders o2 WHERE o2.customer_id = o1.customer_id)')
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DROP TABLE orders
+
+statement ok
+DROP TABLE customers

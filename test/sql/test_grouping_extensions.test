@@ -1,0 +1,69 @@
+# name: test/sql/test_grouping_extensions.test
+# description: Test Substrait generation for grouping extensions
+# group: [sql]
+
+require substrait
+
+# =============================================================================
+# Setup
+# =============================================================================
+
+statement ok
+CREATE TABLE sales (product VARCHAR, region VARCHAR, amount INT)
+
+statement ok
+INSERT INTO sales VALUES 
+    ('A', 'North', 100),
+    ('A', 'South', 150),
+    ('B', 'North', 200),
+    ('B', 'South', 250)
+
+# =============================================================================
+# Test 1: GROUP BY ROLLUP
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT product, region, SUM(amount) AS total FROM sales GROUP BY ROLLUP(product, region)')
+
+# =============================================================================
+# Test 2: GROUP BY CUBE
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT product, region, SUM(amount) AS total FROM sales GROUP BY CUBE(product, region)')
+
+# =============================================================================
+# Test 3: GROUPING SETS
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT product, region, SUM(amount) AS total FROM sales GROUP BY GROUPING SETS ((product), (region), ())')
+
+# =============================================================================
+# Test 4: FILTER clause on aggregate
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT product, COUNT(*) FILTER (WHERE amount > 100) AS high_sales FROM sales GROUP BY product')
+
+# =============================================================================
+# Test 5: Multiple FILTER clauses
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT product, COUNT(*) FILTER (WHERE region = ''North'') AS north_count, COUNT(*) FILTER (WHERE region = ''South'') AS south_count FROM sales GROUP BY product')
+
+# =============================================================================
+# Test 6: GROUPING function
+# SKIP: Grouping functions not supported yet (explicitly documented in code)
+# =============================================================================
+
+# statement ok
+# CALL get_substrait('SELECT product, region, SUM(amount), GROUPING(product, region) AS grp FROM sales GROUP BY ROLLUP(product, region)')
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DROP TABLE sales
