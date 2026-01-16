@@ -545,6 +545,16 @@ unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &
 		substrait::RelRoot temp_root;
 		temp_root.mutable_input()->CopyFrom(sagg.input());
 		select_node->from_table = TransformRootOp(temp_root);
+	} else if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kProject ||
+	           sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kJoin ||
+	           sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kFilter ||
+	           sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kSort ||
+	           sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kFetch) {
+		// Handle Project, Join, Filter, Sort, Fetch operations as aggregate input
+		// Wrap in RelRoot and transform recursively (same pattern as in TransformJoinOp)
+		substrait::RelRoot temp_root;
+		temp_root.mutable_input()->CopyFrom(sagg.input());
+		select_node->from_table = TransformRootOp(temp_root);
 	} else {
 		throw NotImplementedException("Aggregate input type not yet supported: %s",
 		                            substrait::Rel::GetDescriptor()
@@ -788,8 +798,10 @@ unique_ptr<TableRef> SubstraitToAST::TransformJoinOp(const substrait::Rel &sop) 
 		join_ref->left = TransformJoinOp(sjoin.left());
 	} else if (sjoin.left().rel_type_case() == substrait::Rel::RelTypeCase::kProject ||
 	           sjoin.left().rel_type_case() == substrait::Rel::RelTypeCase::kFilter ||
-	           sjoin.left().rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
-		// Handle Project, Filter, or Aggregate operations
+	           sjoin.left().rel_type_case() == substrait::Rel::RelTypeCase::kAggregate ||
+	           sjoin.left().rel_type_case() == substrait::Rel::RelTypeCase::kSort ||
+	           sjoin.left().rel_type_case() == substrait::Rel::RelTypeCase::kFetch) {
+		// Handle Project, Filter, Aggregate, Sort, or Fetch operations
 		// Wrap in RelRoot and transform recursively
 		substrait::RelRoot temp_root;
 		temp_root.mutable_input()->CopyFrom(sjoin.left());
@@ -808,8 +820,10 @@ unique_ptr<TableRef> SubstraitToAST::TransformJoinOp(const substrait::Rel &sop) 
 		join_ref->right = TransformJoinOp(sjoin.right());
 	} else if (sjoin.right().rel_type_case() == substrait::Rel::RelTypeCase::kProject ||
 	           sjoin.right().rel_type_case() == substrait::Rel::RelTypeCase::kFilter ||
-	           sjoin.right().rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
-		// Handle Project, Filter, or Aggregate operations
+	           sjoin.right().rel_type_case() == substrait::Rel::RelTypeCase::kAggregate ||
+	           sjoin.right().rel_type_case() == substrait::Rel::RelTypeCase::kSort ||
+	           sjoin.right().rel_type_case() == substrait::Rel::RelTypeCase::kFetch) {
+		// Handle Project, Filter, Aggregate, Sort, or Fetch operations
 		// Wrap in RelRoot and transform recursively
 		substrait::RelRoot temp_root;
 		temp_root.mutable_input()->CopyFrom(sjoin.right());

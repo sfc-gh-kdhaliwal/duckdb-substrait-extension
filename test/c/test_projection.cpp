@@ -375,3 +375,52 @@ TEST_CASE("Test tpcds Q32", "[substrait-api]") {
 	REQUIRE(CHECK_COLUMN(res1, 5, {10.0, 10.0, 15.0, 15.0, 20.0, 20.0, 30.0, 30.0, 18.75}));
 	REQUIRE(CHECK_COLUMN(res1, 6, {90.0, 90.0, 135.0,  135.0, 180.0, 180.0, 270.0, 270.0, 168.5}));
 }
+
+TEST_CASE("Test two-phase query with CTE join and aggregate over project", "[substrait-api]") {
+	// This test verifies that Substrait plans with Aggregate -> Project -> Join structure work correctly.
+	// This pattern occurs with CTEs that have ORDER BY/LIMIT followed by a JOIN and outer GROUP BY.
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	// Create test table
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE users (user_id INT, region_id INT, score INT, url VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO users VALUES "
+		"(1, 10, 100, 'a.com'), "
+		"(2, 10, 200, 'b.com'), "
+		"(1, 10, 150, 'a.com'), "
+		"(3, 20, 300, 'c.com'), "
+		"(4, 20, 400, 'd.com'), "
+		"(3, 20, 350, 'c.com')"));
+
+	// Two-phase query: CTE with aggregate + limit, then join back and aggregate again
+	// This creates a plan structure: Aggregate -> Project -> Join -> (Fetch on one side)
+	auto two_phase_sql = R"(
+		WITH phase1 AS (
+			SELECT region_id, COUNT(*) AS cnt, SUM(score) AS total_score
+			FROM users
+			GROUP BY region_id
+			ORDER BY cnt DESC
+			LIMIT 2
+		)
+		SELECT 
+			phase1.region_id,
+			phase1.cnt,
+			COUNT(DISTINCT users.user_id) AS distinct_users,
+			phase1.total_score
+		FROM phase1
+		INNER JOIN users ON phase1.region_id = users.region_id
+		GROUP BY phase1.region_id, phase1.cnt, phase1.total_score
+		ORDER BY phase1.cnt DESC
+	)";
+
+	// Execute via Substrait roundtrip
+	auto result = ExecuteViaSubstraitJSON(con, two_phase_sql);
+
+	// Both regions have 3 rows each, 2 distinct users each
+	// region 10: users 1,2 with scores 100+200+150=450
+	// region 20: users 3,4 with scores 300+400+350=1050
+	REQUIRE(CHECK_COLUMN(result, 0, {20, 10}));  // region_id (ordered by cnt DESC, but both have cnt=3)
+	REQUIRE(CHECK_COLUMN(result, 1, {3, 3}));    // cnt
+	REQUIRE(CHECK_COLUMN(result, 2, {2, 2}));    // distinct_users
+	REQUIRE(CHECK_COLUMN(result, 3, {1050, 450})); // total_score
+}
