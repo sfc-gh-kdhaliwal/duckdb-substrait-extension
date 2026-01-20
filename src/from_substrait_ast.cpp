@@ -578,37 +578,7 @@ unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &
 			}
 			select_node->where_clause = std::move(filter_expr);
 		}
-	} else if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kFilter) {
-		auto &filter = sagg.input().filter();
-		auto &filter_input = filter.input();
-		if (filter_input.rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
-			unique_ptr<ParsedExpression> read_filter_expr;
-			select_node->from_table = TransformReadOp(filter_input, &read_filter_expr, &projection_info);
-			auto &read_input = filter_input.read();
-			
-			auto top_filter_expr = TransformExpr(filter.condition());
-			top_filter_expr = RemapFieldReferences(std::move(top_filter_expr), projection_info);
-			if (read_input.has_base_schema()) {
-				top_filter_expr = ConvertPositionalToColumnRef(std::move(top_filter_expr), read_input.base_schema());
-				if (read_filter_expr) {
-					read_filter_expr = ConvertPositionalToColumnRef(std::move(read_filter_expr), read_input.base_schema());
-				}
-			}
-			if (read_filter_expr && top_filter_expr) {
-				vector<unique_ptr<ParsedExpression>> children;
-				children.push_back(std::move(read_filter_expr));
-				children.push_back(std::move(top_filter_expr));
-				select_node->where_clause = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(children));
-			} else if (read_filter_expr) {
-				select_node->where_clause = std::move(read_filter_expr);
-			} else if (top_filter_expr) {
-				select_node->where_clause = std::move(top_filter_expr);
-			}
-		} else {
-			substrait::RelRoot temp_root;
-			temp_root.mutable_input()->CopyFrom(sagg.input());
-			select_node->from_table = TransformRootOp(temp_root);
-		}
+
 	} else if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
 		// Nested aggregate (e.g., in scalar subqueries)
 		// Wrap in RelRoot and transform recursively
@@ -1280,7 +1250,7 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 			select_node->select_list.push_back(make_uniq<StarExpression>());
 		}
 
-		// Add modifiers (ORDER BY, LIMIT) to the query node
+
 		for (auto &modifier : modifiers) {
 			select_node->modifiers.push_back(std::move(modifier));
 		}
