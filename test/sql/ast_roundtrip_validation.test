@@ -1,0 +1,363 @@
+# name: test/sql/ast_roundtrip_validation.test
+# description: Comprehensive round-trip validation for AST-based Substrait consumer
+# group: [substrait]
+
+require substrait
+
+statement ok
+PRAGMA enable_verification
+
+# =============================================================================
+# PHASE 1: EXPRESSION SUPPORT - Basic Literals and Operations
+# =============================================================================
+
+# Test 1.1: Basic integer and string literals
+statement ok
+CALL get_substrait('SELECT 42, ''hello''')
+
+# Test 1.2: All numeric types
+statement ok
+CALL get_substrait('SELECT 1::TINYINT, 100::SMALLINT, 1000::INTEGER, 10000::BIGINT, 3.14::FLOAT, 2.718::DOUBLE')
+
+# Test 1.3: Boolean literals
+statement ok
+CALL get_substrait('SELECT TRUE, FALSE')
+
+# Test 1.4: NULL values
+statement ok
+CALL get_substrait('SELECT NULL')
+
+# Test 1.5: Decimal literals
+statement ok
+CALL get_substrait('SELECT 123.45::DECIMAL(10,2)')
+
+# Test 1.6: Date and time literals
+statement ok
+CALL get_substrait('SELECT DATE ''2024-01-15'', TIME ''14:30:00''')
+
+# Test 1.7: Interval literals
+statement ok
+CALL get_substrait('SELECT INTERVAL ''5'' DAYS')
+
+# =============================================================================
+# PHASE 1: EXPRESSION SUPPORT - Comparison and Logical Operators
+# =============================================================================
+
+statement ok
+CREATE TABLE test_data (id INTEGER, value INTEGER, name VARCHAR)
+
+statement ok
+INSERT INTO test_data VALUES (1, 10, 'alice'), (2, 20, 'bob'), (3, 30, 'charlie')
+
+# Test 1.8-1.11: Comparison operators
+statement ok
+CALL get_substrait('SELECT * FROM test_data WHERE value > 15')
+
+statement ok
+CALL get_substrait('SELECT * FROM test_data WHERE value <= 20')
+
+statement ok
+CALL get_substrait('SELECT * FROM test_data WHERE name = ''bob''')
+
+statement ok
+CALL get_substrait('SELECT * FROM test_data WHERE value <> 20')
+
+# Test 1.12-1.14: Logical operators
+statement ok
+CALL get_substrait('SELECT * FROM test_data WHERE value > 10 AND value < 30')
+
+statement ok
+CALL get_substrait('SELECT * FROM test_data WHERE value < 15 OR value > 25')
+
+statement ok
+CALL get_substrait('SELECT * FROM test_data WHERE NOT (value = 20)')
+
+# Test 1.15-1.16: NULL checks
+statement ok
+INSERT INTO test_data VALUES (4, NULL, 'david')
+
+statement ok
+CALL get_substrait('SELECT * FROM test_data WHERE value IS NULL')
+
+statement ok
+CALL get_substrait('SELECT * FROM test_data WHERE value IS NOT NULL ORDER BY id')
+
+# Test 1.17: Cast expressions
+statement ok
+CALL get_substrait('SELECT id::VARCHAR, value::DOUBLE FROM test_data WHERE id = 1')
+
+# Test 1.18: CASE/WHEN expressions
+statement ok
+CALL get_substrait('SELECT id, CASE WHEN value < 20 THEN ''low'' WHEN value < 30 THEN ''medium'' ELSE ''high'' END FROM test_data WHERE id <= 3 ORDER BY id')
+
+# Test 1.19: IN operator
+statement ok
+CALL get_substrait('SELECT * FROM test_data WHERE id IN (1, 3) ORDER BY id')
+
+# =============================================================================
+# PHASE 2: BASIC RELATION OPERATIONS
+# =============================================================================
+
+# Test 2.1: Simple SELECT with projection
+statement ok
+CALL get_substrait('SELECT name FROM test_data WHERE id = 2')
+
+# Test 2.2: Filter operations
+statement ok
+CALL get_substrait('SELECT * FROM test_data WHERE value > 15 AND value < 25')
+
+# Test 2.3-2.4: Sort operations
+statement ok
+CALL get_substrait('SELECT * FROM test_data WHERE id <= 3 ORDER BY value DESC')
+
+statement ok
+CALL get_substrait('SELECT * FROM test_data WHERE id <= 3 ORDER BY value ASC')
+
+# Test 2.5-2.6: LIMIT and OFFSET
+statement ok
+CALL get_substrait('SELECT * FROM test_data WHERE id <= 3 ORDER BY id LIMIT 2')
+
+statement ok
+CALL get_substrait('SELECT * FROM test_data WHERE id <= 3 ORDER BY id LIMIT 2 OFFSET 1')
+
+# Test 2.7: Chained operations
+statement ok
+CALL get_substrait('SELECT * FROM test_data WHERE value IS NOT NULL ORDER BY value DESC LIMIT 2')
+
+# =============================================================================
+# PHASE 3: AGGREGATE OPERATIONS
+# =============================================================================
+
+statement ok
+CREATE TABLE sales (product VARCHAR, category VARCHAR, amount DECIMAL(10,2))
+
+statement ok
+INSERT INTO sales VALUES
+  ('Widget', 'A', 100.00),
+  ('Gadget', 'A', 150.00),
+  ('Tool', 'B', 75.00),
+  ('Device', 'B', 200.00),
+  ('Thing', 'A', 50.00)
+
+# Test 3.1: Basic aggregates without GROUP BY
+statement ok
+CALL get_substrait('SELECT COUNT(*), COUNT(amount), SUM(amount), AVG(amount) FROM sales')
+
+# Test 3.2: MIN and MAX aggregates
+statement ok
+CALL get_substrait('SELECT MIN(amount), MAX(amount) FROM sales')
+
+# Test 3.3: GROUP BY single column
+statement ok
+CALL get_substrait('SELECT category, SUM(amount) FROM sales GROUP BY category ORDER BY category')
+
+# Test 3.4: GROUP BY with multiple aggregates
+statement ok
+CALL get_substrait('SELECT category, COUNT(*), AVG(amount) FROM sales GROUP BY category ORDER BY category')
+
+# Test 3.5: GROUP BY with ORDER BY
+statement ok
+CALL get_substrait('SELECT category, SUM(amount) as total FROM sales GROUP BY category ORDER BY total DESC')
+
+# Test 3.6: DISTINCT aggregates
+statement ok
+CALL get_substrait('SELECT COUNT(DISTINCT category) FROM sales')
+
+# Test 3.7: HAVING clause
+statement ok
+CALL get_substrait('SELECT category, SUM(amount) as total FROM sales GROUP BY category HAVING SUM(amount) > 280 ORDER BY category')
+
+# Test 3.8: HAVING with multiple conditions
+statement ok
+CALL get_substrait('SELECT category, AVG(amount) as avg_amount FROM sales GROUP BY category HAVING COUNT(*) >= 2 AND AVG(amount) > 90 ORDER BY category')
+
+# =============================================================================
+# PHASE 4: JOIN OPERATIONS
+# =============================================================================
+
+statement ok
+CREATE TABLE employees (emp_id INTEGER, emp_name VARCHAR, dept_id INTEGER)
+
+statement ok
+CREATE TABLE departments (dept_id INTEGER, dept_name VARCHAR, location VARCHAR)
+
+statement ok
+INSERT INTO employees VALUES (1, 'Alice', 1), (2, 'Bob', 2), (3, 'Charlie', 1), (4, 'Diana', 3)
+
+statement ok
+INSERT INTO departments VALUES (1, 'Engineering', 'Building A'), (2, 'Sales', 'Building B'), (3, 'HR', 'Building A')
+
+# Test 4.1: INNER JOIN
+statement ok
+CALL get_substrait('SELECT e.emp_id, e.emp_name, d.dept_id, d.dept_name FROM employees e INNER JOIN departments d ON e.dept_id = d.dept_id ORDER BY e.emp_id')
+
+# Test 4.2: INNER JOIN with WHERE clause
+statement ok
+CALL get_substrait('SELECT e.emp_name, e.dept_id, d.dept_name FROM employees e INNER JOIN departments d ON e.dept_id = d.dept_id WHERE d.location = ''Building A'' ORDER BY e.emp_name')
+
+# Test 4.3: LEFT JOIN
+statement ok
+INSERT INTO employees VALUES (5, 'Eve', 99)
+
+statement ok
+CALL get_substrait('SELECT e.emp_id, e.emp_name, d.dept_id, d.dept_name FROM employees e LEFT JOIN departments d ON e.dept_id = d.dept_id ORDER BY e.emp_id')
+
+# Test 4.4: Multi-table JOIN
+statement ok
+CREATE TABLE projects (project_id INTEGER, project_name VARCHAR, dept_id INTEGER)
+
+statement ok
+INSERT INTO projects VALUES (101, 'Project Alpha', 1), (102, 'Project Beta', 2), (103, 'Project Gamma', 1)
+
+statement ok
+CALL get_substrait('SELECT e.emp_name, d.dept_name, p.project_name FROM employees e INNER JOIN departments d ON e.dept_id = d.dept_id INNER JOIN projects p ON d.dept_id = p.dept_id WHERE e.emp_id <= 3 ORDER BY e.emp_name, p.project_name')
+
+# Test 4.5: CROSS JOIN
+statement ok
+CREATE TABLE colors (color VARCHAR)
+
+statement ok
+CREATE TABLE sizes (size VARCHAR)
+
+statement ok
+INSERT INTO colors VALUES ('Red'), ('Blue')
+
+statement ok
+INSERT INTO sizes VALUES ('Small'), ('Large')
+
+statement ok
+CALL get_substrait('SELECT * FROM colors, sizes ORDER BY color, size')
+
+# =============================================================================
+# PHASE 5: SET OPERATIONS
+# =============================================================================
+
+statement ok
+CREATE TABLE set_a (id INTEGER, value VARCHAR)
+
+statement ok
+CREATE TABLE set_b (id INTEGER, value VARCHAR)
+
+statement ok
+INSERT INTO set_a VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry')
+
+statement ok
+INSERT INTO set_b VALUES (2, 'banana'), (3, 'cherry'), (4, 'date')
+
+# Test 5.1: UNION
+statement ok
+CALL get_substrait('SELECT * FROM set_a UNION SELECT * FROM set_b ORDER BY id')
+
+# Test 5.2: UNION ALL
+statement ok
+CALL get_substrait('SELECT * FROM set_a UNION ALL SELECT * FROM set_b ORDER BY id, value')
+
+# Test 5.3: INTERSECT
+statement ok
+CALL get_substrait('SELECT * FROM set_a INTERSECT SELECT * FROM set_b ORDER BY id')
+
+# Test 5.4: EXCEPT
+statement ok
+CALL get_substrait('SELECT * FROM set_a EXCEPT SELECT * FROM set_b ORDER BY id')
+
+# =============================================================================
+# PHASE 6: ADVANCED FEATURES - Scalar Subqueries
+# =============================================================================
+
+statement ok
+CREATE TABLE products (product_id INTEGER, product_name VARCHAR, price DECIMAL(10,2))
+
+statement ok
+INSERT INTO products VALUES (1, 'Widget', 10.00), (2, 'Gadget', 25.00), (3, 'Tool', 15.00)
+
+# Test 6.1: Scalar subquery with AVG
+statement ok
+CALL get_substrait('SELECT product_name, price FROM products WHERE price > (SELECT AVG(price) FROM products)')
+
+# Test 6.2: Scalar subquery with MIN
+statement ok
+CALL get_substrait('SELECT product_name, price FROM products WHERE price = (SELECT MIN(price) FROM products)')
+
+# Test 6.3: Scalar subquery with MAX
+statement ok
+CALL get_substrait('SELECT product_name, price FROM products WHERE price = (SELECT MAX(price) FROM products)')
+
+# =============================================================================
+# COMPLEX INTEGRATION TESTS
+# =============================================================================
+
+# Test 7.1: Complex query with multiple features
+statement ok
+CALL get_substrait('
+  SELECT
+    e.emp_name,
+    d.dept_name,
+    CASE
+      WHEN d.location = ''Building A'' THEN ''Main Campus''
+      ELSE ''Satellite''
+    END as campus
+  FROM employees e
+  INNER JOIN departments d ON e.dept_id = d.dept_id
+  WHERE e.emp_id IN (1, 2, 3, 4)
+  ORDER BY e.emp_name
+  LIMIT 3
+')
+
+# Test 7.2: Aggregate with JOIN and HAVING
+statement ok
+CALL get_substrait('
+  SELECT
+    d.dept_name,
+    COUNT(*) as emp_count,
+    d.location
+  FROM employees e
+  INNER JOIN departments d ON e.dept_id = d.dept_id
+  WHERE e.emp_id <= 4
+  GROUP BY d.dept_name, d.location
+  HAVING COUNT(*) >= 1
+  ORDER BY emp_count DESC, d.dept_name
+')
+
+# Test 7.3: Set operation with ORDER BY and LIMIT
+statement ok
+CALL get_substrait('
+  SELECT product_name FROM products WHERE price < 20
+  UNION ALL
+  SELECT product_name FROM products WHERE price > 20
+  ORDER BY product_name
+  LIMIT 3
+')
+
+# =============================================================================
+# CLEANUP
+# =============================================================================
+
+statement ok
+DROP TABLE test_data
+
+statement ok
+DROP TABLE sales
+
+statement ok
+DROP TABLE employees
+
+statement ok
+DROP TABLE departments
+
+statement ok
+DROP TABLE projects
+
+statement ok
+DROP TABLE colors
+
+statement ok
+DROP TABLE sizes
+
+statement ok
+DROP TABLE set_a
+
+statement ok
+DROP TABLE set_b
+
+statement ok
+DROP TABLE products

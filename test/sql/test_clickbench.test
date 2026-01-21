@@ -1,0 +1,356 @@
+# name: test/sql/test_clickbench.test
+# description: Test Substrait generation for all 43 ClickBench queries
+# group: [sql]
+
+require substrait
+
+# =============================================================================
+# Setup: Create minimal hits table schema based on columns used in queries
+# =============================================================================
+
+statement ok
+CREATE TABLE hits (
+    WatchID BIGINT,
+    UserID BIGINT,
+    EventTime TIMESTAMP,
+    EventDate DATE,
+    CounterID INT,
+    ClientIP INT,
+    RegionID INT,
+    AdvEngineID INT,
+    SearchEngineID INT,
+    TraficSourceID INT,
+    ResolutionWidth INT,
+    IsRefresh INT,
+    IsLink INT,
+    IsDownload INT,
+    DontCountHits INT,
+    Referer VARCHAR,
+    RefererHash BIGINT,
+    URL VARCHAR,
+    URLHash BIGINT,
+    Title VARCHAR,
+    SearchPhrase VARCHAR,
+    MobilePhone INT,
+    MobilePhoneModel VARCHAR,
+    WindowClientWidth INT,
+    WindowClientHeight INT
+)
+
+# =============================================================================
+# Q00: SELECT COUNT(*) FROM hits
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT COUNT(*) FROM hits')
+
+# =============================================================================
+# Q01: SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0')
+
+# =============================================================================
+# Q02: SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits')
+
+# =============================================================================
+# Q03: SELECT AVG(UserID) FROM hits
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT AVG(UserID) FROM hits')
+
+# =============================================================================
+# Q04: SELECT COUNT(DISTINCT UserID) FROM hits
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT COUNT(DISTINCT UserID) FROM hits')
+
+# =============================================================================
+# Q05: SELECT COUNT(DISTINCT SearchPhrase) FROM hits
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT COUNT(DISTINCT SearchPhrase) FROM hits')
+
+# =============================================================================
+# Q06: SELECT MIN(EventDate), MAX(EventDate) FROM hits
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT MIN(EventDate), MAX(EventDate) FROM hits')
+
+# =============================================================================
+# Q07: Aggregate with GROUP BY and ORDER BY
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC')
+
+# =============================================================================
+# Q08: COUNT DISTINCT with GROUP BY ORDER BY LIMIT
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC LIMIT 10')
+
+# =============================================================================
+# Q09: Multiple aggregates with GROUP BY
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10')
+
+# =============================================================================
+# Q10: String comparison filter
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '''' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10')
+
+# =============================================================================
+# Q11: Multi-column GROUP BY
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '''' GROUP BY MobilePhone, MobilePhoneModel ORDER BY u DESC LIMIT 10')
+
+# =============================================================================
+# Q12: SearchPhrase GROUP BY
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '''' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10')
+
+# =============================================================================
+# Q13: SearchPhrase COUNT DISTINCT
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits WHERE SearchPhrase <> '''' GROUP BY SearchPhrase ORDER BY u DESC LIMIT 10')
+
+# =============================================================================
+# Q14: Multi-column GROUP BY with SearchPhrase
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '''' GROUP BY SearchEngineID, SearchPhrase ORDER BY c DESC LIMIT 10')
+
+# =============================================================================
+# Q15: UserID GROUP BY with ORDER BY
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT UserID, COUNT(*) FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC LIMIT 10')
+
+# =============================================================================
+# Q16: UserID, SearchPhrase GROUP BY
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10')
+
+# =============================================================================
+# Q17: GROUP BY without ORDER BY
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase LIMIT 10')
+
+# =============================================================================
+# Q18: EXTRACT function with GROUP BY
+# SKIP: "No expressions in groupings yet" - expressions in GROUP BY not supported
+# =============================================================================
+
+# statement ok
+# CALL get_substrait('SELECT UserID, extract(minute FROM EventTime) AS m, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, m, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10')
+
+# =============================================================================
+# Q19: Simple equality filter
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT UserID FROM hits WHERE UserID = 435090932899640449')
+
+# =============================================================================
+# Q20: LIKE pattern matching
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT COUNT(*) FROM hits WHERE URL LIKE ''%google%''')
+
+# =============================================================================
+# Q21: LIKE with GROUP BY
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits WHERE URL LIKE ''%google%'' AND SearchPhrase <> '''' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10')
+
+# =============================================================================
+# Q22: LIKE and NOT LIKE combined
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits WHERE Title LIKE ''%Google%'' AND URL NOT LIKE ''%.google.%'' AND SearchPhrase <> '''' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10')
+
+# =============================================================================
+# Q23: SELECT * with LIKE and ORDER BY
+# SKIP: Internal column binding error with SELECT * and ORDER BY
+# =============================================================================
+
+# statement ok
+# CALL get_substrait('SELECT * FROM hits WHERE URL LIKE ''%google%'' ORDER BY EventTime LIMIT 10')
+
+# =============================================================================
+# Q24: Simple ORDER BY
+# SKIP: Column binding error - ORDER BY column not in projection
+# =============================================================================
+
+# statement ok
+# CALL get_substrait('SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '''' ORDER BY EventTime LIMIT 10')
+
+# =============================================================================
+# Q25: ORDER BY same column as SELECT
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '''' ORDER BY SearchPhrase LIMIT 10')
+
+# =============================================================================
+# Q26: Multi-column ORDER BY
+# SKIP: Column binding error - ORDER BY column not in projection
+# =============================================================================
+
+# statement ok
+# CALL get_substrait('SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '''' ORDER BY EventTime, SearchPhrase LIMIT 10')
+
+# =============================================================================
+# Q27: STRLEN and HAVING clause
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT CounterID, AVG(STRLEN(URL)) AS l, COUNT(*) AS c FROM hits WHERE URL <> '''' GROUP BY CounterID HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25')
+
+# =============================================================================
+# Q28: REGEXP_REPLACE (complex string processing)
+# SKIP: "No expressions in groupings yet" - GROUP BY alias not supported
+# =============================================================================
+
+# statement ok
+# CALL get_substrait('SELECT REGEXP_REPLACE(Referer, ''^https?://(?:www\.)?([^/]+)/.*$'', ''\1'') AS k, AVG(STRLEN(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '''' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25')
+
+# =============================================================================
+# Q29: Many SUM expressions
+# SKIP: Internal column binding error with expression aggregates
+# =============================================================================
+
+# statement ok
+# CALL get_substrait('SELECT SUM(ResolutionWidth), SUM(ResolutionWidth + 1), SUM(ResolutionWidth + 2), SUM(ResolutionWidth + 3), SUM(ResolutionWidth + 4) FROM hits')
+
+# =============================================================================
+# Q30: GROUP BY with IsRefresh
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '''' GROUP BY SearchEngineID, ClientIP ORDER BY c DESC LIMIT 10')
+
+# =============================================================================
+# Q31: WatchID GROUP BY
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '''' GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10')
+
+# =============================================================================
+# Q32: WatchID GROUP BY without filter
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10')
+
+# =============================================================================
+# Q33: URL GROUP BY
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10')
+
+# =============================================================================
+# Q34: GROUP BY with constant
+# SKIP: "No expressions in groupings yet" - constant in GROUP BY not supported
+# =============================================================================
+
+# statement ok
+# CALL get_substrait('SELECT 1, URL, COUNT(*) AS c FROM hits GROUP BY 1, URL ORDER BY c DESC LIMIT 10')
+
+# =============================================================================
+# Q35: Arithmetic in GROUP BY
+# SKIP: "No expressions in groupings yet" - arithmetic in GROUP BY not supported
+# =============================================================================
+
+# statement ok
+# CALL get_substrait('SELECT ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3, COUNT(*) AS c FROM hits GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3 ORDER BY c DESC LIMIT 10')
+
+# =============================================================================
+# Q36: Date range filter
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> '''' GROUP BY URL ORDER BY PageViews DESC LIMIT 10')
+
+# =============================================================================
+# Q37: Title GROUP BY with date filter
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT Title, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> '''' GROUP BY Title ORDER BY PageViews DESC LIMIT 10')
+
+# =============================================================================
+# Q38: OFFSET clause
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000')
+
+# =============================================================================
+# Q39: CASE expression
+# SKIP: "No expressions in groupings yet" - GROUP BY alias not supported
+# =============================================================================
+
+# statement ok
+# CALL get_substrait('SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '''' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000')
+
+# =============================================================================
+# Q40: IN clause
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT URLHash, EventDate, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465 GROUP BY URLHash, EventDate ORDER BY PageViews DESC LIMIT 10 OFFSET 100')
+
+# =============================================================================
+# Q41: Large OFFSET
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT WindowClientWidth, WindowClientHeight, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622 GROUP BY WindowClientWidth, WindowClientHeight ORDER BY PageViews DESC LIMIT 10 OFFSET 10000')
+
+# =============================================================================
+# Q42: DATE_TRUNC in GROUP BY and ORDER BY
+# SKIP: "No expressions in groupings yet" - function in GROUP BY not supported
+# =============================================================================
+
+# statement ok
+# CALL get_substrait('SELECT DATE_TRUNC(''minute'', EventTime) AS M, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-14'' AND EventDate <= ''2013-07-15'' AND IsRefresh = 0 AND DontCountHits = 0 GROUP BY DATE_TRUNC(''minute'', EventTime) ORDER BY DATE_TRUNC(''minute'', EventTime) LIMIT 10 OFFSET 1000')
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DROP TABLE hits

@@ -1,0 +1,74 @@
+# name: test/sql/test_aggregate_filter_roundtrip.test
+# description: Test roundtrip of aggregations with filters embedded in Read operations
+# group: [sql]
+
+require substrait
+
+statement ok
+PRAGMA enable_verification
+
+# =============================================================================
+# Setup: Create test tables
+# =============================================================================
+
+statement ok
+CREATE TABLE urls (URL VARCHAR, UserID INT);
+
+statement ok
+INSERT INTO urls VALUES 
+  ('https://www.google.com/search', 1),
+  ('https://facebook.com/home', 2),
+  ('https://mail.google.com/inbox', 3),
+  ('https://twitter.com/feed', 4),
+  ('https://docs.google.com/document', 5);
+
+# =============================================================================
+# Test 1: COUNT(*) with LIKE filter - get_substrait should work
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT COUNT(*) FROM urls WHERE URL LIKE ''%google%''')
+
+# =============================================================================
+# Test 2: COUNT(*) with LIKE filter - from_substrait_json roundtrip
+# This tests the fix for filters embedded in Read operations within aggregates
+# =============================================================================
+
+query I
+CALL from_substrait_json('{"extensionUris":[{"extensionUriAnchor":1,"uri":"https://github.com/substrait-io/substrait/blob/main/extensions/functions_string.yaml"},{"extensionUriAnchor":2,"uri":"https://github.com/substrait-io/substrait/blob/main/extensions/functions_aggregate_generic.yaml"}],"extensions":[{"extensionFunction":{"extensionUriReference":1,"functionAnchor":1,"name":"contains:string_string"}},{"extensionFunction":{"extensionUriReference":2,"functionAnchor":2,"name":"count"}}],"relations":[{"root":{"input":{"aggregate":{"input":{"read":{"baseSchema":{"names":["URL","UserID"],"struct":{"types":[{"string":{"nullability":"NULLABILITY_NULLABLE"}},{"i32":{"nullability":"NULLABILITY_NULLABLE"}}],"nullability":"NULLABILITY_REQUIRED"}},"filter":{"scalarFunction":{"functionReference":1,"outputType":{"bool":{"nullability":"NULLABILITY_NULLABLE"}},"arguments":[{"value":{"selection":{"directReference":{"structField":{}},"rootReference":{}}}},{"value":{"literal":{"string":"google"}}}]}},"projection":{"select":{"structItems":[{}]},"maintainSingularStruct":true},"namedTable":{"names":["urls"]}}},"groupings":[{}],"measures":[{"measure":{"functionReference":2,"outputType":{"i64":{"nullability":"NULLABILITY_NULLABLE"}}}}]}},"names":["count_star()"]}}],"version":{"minorNumber":53,"producer":"DuckDB"}}')
+----
+3
+
+# =============================================================================
+# Test 3: SUM with equality filter and GROUP BY - setup
+# =============================================================================
+
+statement ok
+CREATE TABLE sales (category VARCHAR, amount INT);
+
+statement ok
+INSERT INTO sales VALUES 
+  ('Electronics', 100), 
+  ('Electronics', 200), 
+  ('Clothing', 50), 
+  ('Electronics', 150),
+  ('Clothing', 75);
+
+# =============================================================================
+# Test 4: SUM with filter and GROUP BY - from_substrait_json roundtrip
+# =============================================================================
+
+query II
+CALL from_substrait_json('{"extensionUris":[{"extensionUriAnchor":1,"uri":"https://github.com/substrait-io/substrait/blob/main/extensions/"},{"extensionUriAnchor":2,"uri":"https://github.com/substrait-io/substrait/blob/main/extensions/functions_arithmetic.yaml"}],"extensions":[{"extensionFunction":{"extensionUriReference":1,"functionAnchor":1,"name":"equal:string_string"}},{"extensionFunction":{"extensionUriReference":2,"functionAnchor":2,"name":"sum:i32"}}],"relations":[{"root":{"input":{"aggregate":{"input":{"read":{"baseSchema":{"names":["category","amount"],"struct":{"types":[{"string":{"nullability":"NULLABILITY_NULLABLE"}},{"i32":{"nullability":"NULLABILITY_NULLABLE"}}],"nullability":"NULLABILITY_REQUIRED"}},"filter":{"scalarFunction":{"functionReference":1,"outputType":{"bool":{"nullability":"NULLABILITY_NULLABLE"}},"arguments":[{"value":{"selection":{"directReference":{"structField":{}},"rootReference":{}}}},{"value":{"literal":{"string":"Electronics"}}}]}},"projection":{"select":{"structItems":[{},{"field":1}]},"maintainSingularStruct":true},"namedTable":{"names":["sales"]}}},"groupings":[{"groupingExpressions":[{"selection":{"directReference":{"structField":{}},"rootReference":{}}}]}],"measures":[{"measure":{"functionReference":2,"outputType":{"decimal":{"precision":38,"nullability":"NULLABILITY_NULLABLE"}},"arguments":[{"value":{"selection":{"directReference":{"structField":{"field":1}},"rootReference":{}}}}]}}]}},"names":["category","total"]}}],"version":{"minorNumber":53,"producer":"DuckDB"}}')
+----
+Electronics	450
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DROP TABLE urls
+
+statement ok
+DROP TABLE sales

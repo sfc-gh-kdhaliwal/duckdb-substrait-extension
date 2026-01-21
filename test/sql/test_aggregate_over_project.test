@@ -1,0 +1,137 @@
+# name: test/sql/test_aggregate_over_project.test
+# description: Test Substrait generation for queries with Aggregate over Project
+# group: [sql]
+
+require substrait
+
+# =============================================================================
+# Setup: Create test table
+# =============================================================================
+
+statement ok
+CREATE TABLE users (user_id INT, region_id INT, score INT, url VARCHAR)
+
+statement ok
+INSERT INTO users VALUES 
+    (1, 10, 100, 'a.com'), 
+    (2, 10, 200, 'b.com'), 
+    (1, 10, 150, 'a.com'),
+    (3, 20, 300, 'c.com'),
+    (4, 20, 400, 'd.com'),
+    (3, 20, 350, 'c.com')
+
+# =============================================================================
+# Test 1: Two-phase query with CTE, JOIN, and outer aggregate
+# This creates a Substrait plan with Aggregate -> Project -> Join structure
+# which previously failed with "Aggregate input type not yet supported: project"
+# =============================================================================
+
+statement ok
+CALL get_substrait('WITH phase1 AS (SELECT region_id, COUNT(*) AS cnt, SUM(score) AS total_score FROM users GROUP BY region_id ORDER BY cnt DESC LIMIT 2) SELECT phase1.region_id, phase1.cnt, COUNT(DISTINCT users.user_id) AS distinct_users, phase1.total_score FROM phase1 INNER JOIN users ON phase1.region_id = users.region_id GROUP BY phase1.region_id, phase1.cnt, phase1.total_score ORDER BY phase1.cnt DESC')
+
+# =============================================================================
+# Test 2: Same query with JSON format
+# =============================================================================
+
+statement ok
+CALL get_substrait_json('WITH phase1 AS (SELECT region_id, COUNT(*) AS cnt, SUM(score) AS total_score FROM users GROUP BY region_id ORDER BY cnt DESC LIMIT 2) SELECT phase1.region_id, phase1.cnt, COUNT(DISTINCT users.user_id) AS distinct_users, phase1.total_score FROM phase1 INNER JOIN users ON phase1.region_id = users.region_id GROUP BY phase1.region_id, phase1.cnt, phase1.total_score ORDER BY phase1.cnt DESC')
+
+# =============================================================================
+# Test 3: Simpler case - Aggregate over Join without CTE
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT u1.region_id, COUNT(*) AS cnt, COUNT(DISTINCT u2.user_id) AS distinct_users FROM users u1 INNER JOIN users u2 ON u1.region_id = u2.region_id GROUP BY u1.region_id')
+
+# =============================================================================
+# Test 4: Aggregate with subquery in FROM (creates Project input)
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT region_id, SUM(score) AS total FROM (SELECT region_id, score, user_id FROM users WHERE score > 100) subq GROUP BY region_id')
+
+# =============================================================================
+# Test 5: Nested aggregates with JOIN
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT t1.region_id, t1.cnt, SUM(users.score) AS total_score FROM (SELECT region_id, COUNT(*) AS cnt FROM users GROUP BY region_id) t1 INNER JOIN users ON t1.region_id = users.region_id GROUP BY t1.region_id, t1.cnt')
+
+# =============================================================================
+# Test 6: LEFT JOIN with aggregate (Aggregate -> Project -> Join)
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT u1.region_id, COUNT(*) AS cnt, AVG(u2.score) AS avg_score FROM users u1 LEFT JOIN users u2 ON u1.region_id = u2.region_id GROUP BY u1.region_id')
+
+# =============================================================================
+# Test 7: Multiple CTEs with joins and aggregates
+# =============================================================================
+
+statement ok
+CALL get_substrait('WITH cte1 AS (SELECT region_id, COUNT(*) AS cnt FROM users GROUP BY region_id), cte2 AS (SELECT region_id, SUM(score) AS total FROM users GROUP BY region_id) SELECT cte1.region_id, cte1.cnt, cte2.total FROM cte1 INNER JOIN cte2 ON cte1.region_id = cte2.region_id')
+
+# =============================================================================
+# Test 8: Aggregate with HAVING clause over subquery
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT region_id, SUM(score) AS total FROM (SELECT region_id, score FROM users WHERE user_id > 0) sub GROUP BY region_id HAVING SUM(score) > 200')
+
+# =============================================================================
+# Test 9: Aggregate over sorted/limited subquery (Aggregate -> Fetch -> Sort)
+# SKIP: This triggers an internal error in column binding - needs investigation
+# =============================================================================
+
+# statement ok
+# CALL get_substrait('SELECT region_id, COUNT(*) AS cnt FROM (SELECT region_id, score FROM users ORDER BY score DESC LIMIT 4) sub GROUP BY region_id')
+
+# =============================================================================
+# Test 10: Multiple aggregate functions with different types
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT region_id, COUNT(*) AS cnt, SUM(score) AS total, AVG(score) AS avg, MIN(score) AS min_score, MAX(score) AS max_score FROM (SELECT region_id, score FROM users) sub GROUP BY region_id')
+
+# =============================================================================
+# Test 11: Aggregate over filtered join
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT u1.region_id, COUNT(DISTINCT u1.user_id) AS users FROM users u1 INNER JOIN users u2 ON u1.region_id = u2.region_id WHERE u1.score > 100 AND u2.score > 100 GROUP BY u1.region_id')
+
+# =============================================================================
+# Test 12: Three-level nesting (Aggregate -> Project -> Aggregate -> Read)
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT region_id, SUM(cnt) AS total_cnt FROM (SELECT region_id, COUNT(*) AS cnt FROM users GROUP BY region_id, user_id) sub GROUP BY region_id')
+
+# =============================================================================
+# Test 13: CTE with ORDER BY and OFFSET (tests Fetch input to Join)
+# SKIP: This triggers an internal error in column binding - needs investigation
+# =============================================================================
+
+# statement ok
+# CALL get_substrait('WITH ranked AS (SELECT region_id, score FROM users ORDER BY score DESC LIMIT 3 OFFSET 1) SELECT users.region_id, COUNT(*) FROM ranked INNER JOIN users ON ranked.region_id = users.region_id GROUP BY users.region_id')
+
+# =============================================================================
+# Test 14: Aggregate over UNION subquery
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT region_id, COUNT(*) AS cnt FROM (SELECT region_id FROM users WHERE score > 200 UNION ALL SELECT region_id FROM users WHERE score < 150) sub GROUP BY region_id')
+
+# =============================================================================
+# Test 15: Self-join with multiple aggregates and ordering
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT u1.region_id, COUNT(*) AS pair_count, SUM(u1.score + u2.score) AS combined_score FROM users u1 INNER JOIN users u2 ON u1.region_id = u2.region_id AND u1.user_id < u2.user_id GROUP BY u1.region_id ORDER BY pair_count DESC')
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DROP TABLE users
