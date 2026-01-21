@@ -157,6 +157,7 @@ string SubstraitToAST::FindFunction(uint64_t id) {
 }
 
 string SubstraitToAST::RemoveFunctionExtension(const string &function_name) {
+	// Remove extension prefix (e.g., "substrait:add" -> "add") and remap function names
 	auto pos = function_name.find(':');
 	string name = (pos != string::npos) ? function_name.substr(0, pos) : function_name;
 	auto it = function_names_remap.find(name);
@@ -177,6 +178,7 @@ unique_ptr<ParsedExpression> SubstraitToAST::TransformScalarFunctionExpr(const s
 		if (sarg.has_value()) {
 			children.push_back(TransformExpr(sarg.value()));
 		} else if (sarg.has_enum_()) {
+			// Enum arguments (like for EXTRACT function) - treat as string constants
 			auto enum_val = sarg.enum_();
 			children.push_back(make_uniq<ConstantExpression>(Value(enum_val)));
 		} else {
@@ -553,6 +555,7 @@ unique_ptr<ParsedExpression> SubstraitToAST::RemapFieldReferences(unique_ptr<Par
 		return expr;
 	}
 	default:
+		// For other expression types (constants, etc.), no remapping needed
 		return expr;
 	}
 }
@@ -605,6 +608,8 @@ unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &
 			select_node->from_table = TransformRootOp(temp_root);
 		}
 	} else if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
+		// Nested aggregate (e.g., in scalar subqueries)
+		// Wrap in RelRoot and transform recursively
 		substrait::RelRoot temp_root;
 		temp_root.mutable_input()->CopyFrom(sagg.input());
 		select_node->from_table = TransformRootOp(temp_root);
