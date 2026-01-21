@@ -538,7 +538,19 @@ unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &
 
 	// Transform input relation (the FROM clause)
 	if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
-		select_node->from_table = TransformReadOp(sagg.input(), nullptr, &projection_info);
+		// Extract filter from Read operation if present
+		unique_ptr<ParsedExpression> filter_expr;
+		select_node->from_table = TransformReadOp(sagg.input(), &filter_expr, &projection_info);
+
+		// Apply filter as WHERE clause if present
+		if (filter_expr) {
+			auto &read_input = sagg.input().read();
+			if (read_input.has_base_schema()) {
+				// Convert positional references to column names
+				filter_expr = ConvertPositionalToColumnRef(std::move(filter_expr), read_input.base_schema());
+			}
+			select_node->where_clause = std::move(filter_expr);
+		}
 	} else if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
 		// Nested aggregate (e.g., in scalar subqueries)
 		// Wrap in RelRoot and transform recursively
