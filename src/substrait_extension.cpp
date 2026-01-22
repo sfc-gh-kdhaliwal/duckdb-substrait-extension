@@ -296,15 +296,20 @@ static void ToJsonFunction(ClientContext &context, TableFunctionInput &data_p, D
 }
 
 static unique_ptr<TableRef> SubstraitBindReplace(ClientContext &context, TableFunctionBindInput &input, bool is_json) {
+	// Use SubstraitToAST for pure AST transformation (no Relations, no binding)
+	//
+	// This avoids lock re-entrancy issues by building AST nodes directly
+	// instead of creating Relations that try to bind themselves.
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("from_substrait cannot be called with a NULL parameter");
 	}
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
 
+	// Transform Substrait → DuckDB TableRef (pure AST, no binding!)
 	SubstraitToAST transformer(context, serialized, is_json);
 	auto table_ref = transformer.TransformPlanToTableRef();
 
-	return table_ref;
+	return table_ref;  // ✅ Returns AST directly - DuckDB will bind it in the outer query context
 }
 
 static unique_ptr<TableRef> FromSubstraitBindReplace(ClientContext &context, TableFunctionBindInput &input) {
