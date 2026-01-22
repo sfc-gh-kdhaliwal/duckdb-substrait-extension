@@ -24,6 +24,14 @@
 
 namespace duckdb {
 
+// Ported from legacy from_substrait.cpp - maps Substrait function names to DuckDB equivalents
+const std::unordered_map<std::string, std::string> function_names_remap = {
+    {"modulus", "mod"},      {"std_dev", "stddev"},     {"starts_with", "prefix"},
+    {"ends_with", "suffix"}, {"substring", "substr"},   {"char_length", "length"},
+    {"is_nan", "isnan"},     {"is_finite", "isfinite"}, {"is_infinite", "isinf"},
+    {"like", "~~"},          {"extract", "date_part"},  {"bitwise_and", "&"},
+    {"bitwise_or", "|"},     {"bitwise_xor", "xor"},    {"octet_length", "strlen"}};
+
 SubstraitToAST::SubstraitToAST(ClientContext &context_p, const string &serialized, bool json)
     : context(context_p) {
 	if (!json) {
@@ -53,6 +61,8 @@ Value SubstraitToAST::TransformLiteralToValue(const substrait::Expression_Litera
 	switch (literal.literal_type_case()) {
 	case substrait::Expression_Literal::LiteralTypeCase::kI8:
 		return Value::TINYINT(static_cast<int8_t>(literal.i8()));
+	case substrait::Expression_Literal::LiteralTypeCase::kI16:
+		return Value::SMALLINT(static_cast<int16_t>(literal.i16()));
 	case substrait::Expression_Literal::LiteralTypeCase::kI32:
 		return Value::INTEGER(literal.i32());
 	case substrait::Expression_Literal::LiteralTypeCase::kI64:
@@ -147,13 +157,12 @@ string SubstraitToAST::FindFunction(uint64_t id) {
 }
 
 string SubstraitToAST::RemoveFunctionExtension(const string &function_name) {
-	// Remove extension prefix (e.g., "substrait:add" -> "add")
-	string name;
-	for (auto &c : function_name) {
-		if (c == ':') {
-			break;
-		}
-		name += c;
+	// Remove extension prefix (e.g., "substrait:add" -> "add") and remap function names
+	auto pos = function_name.find(':');
+	string name = (pos != string::npos) ? function_name.substr(0, pos) : function_name;
+	auto it = function_names_remap.find(name);
+	if (it != function_names_remap.end()) {
+		return it->second;
 	}
 	return name;
 }
@@ -169,8 +178,7 @@ unique_ptr<ParsedExpression> SubstraitToAST::TransformScalarFunctionExpr(const s
 		if (sarg.has_value()) {
 			children.push_back(TransformExpr(sarg.value()));
 		} else if (sarg.has_enum_()) {
-			// Enum arguments (like for EXTRACT function)
-			// We'll handle these specially
+			// Enum arguments (like for EXTRACT function) - treat as string constants
 			auto enum_val = sarg.enum_();
 			children.push_back(make_uniq<ConstantExpression>(Value(enum_val)));
 		} else {
@@ -518,11 +526,32 @@ unique_ptr<ParsedExpression> SubstraitToAST::RemapFieldReferences(unique_ptr<Par
 		}
 		return expr;
 	}
+	case ExpressionType::COMPARE_IN: {
+		auto &op = expr->Cast<OperatorExpression>();
+		for (auto &child : op.children) {
+			child = RemapFieldReferences(std::move(child), projection_info);
+		}
+		return expr;
+	}
 	case ExpressionType::FUNCTION: {
 		auto &func = expr->Cast<FunctionExpression>();
 		for (auto &child : func.children) {
 			child = RemapFieldReferences(std::move(child), projection_info);
 		}
+		return expr;
+	}
+	case ExpressionType::CASE_EXPR: {
+		auto &case_expr = expr->Cast<CaseExpression>();
+		for (auto &check : case_expr.case_checks) {
+			check.when_expr = RemapFieldReferences(std::move(check.when_expr), projection_info);
+			check.then_expr = RemapFieldReferences(std::move(check.then_expr), projection_info);
+		}
+		case_expr.else_expr = RemapFieldReferences(std::move(case_expr.else_expr), projection_info);
+		return expr;
+	}
+	case ExpressionType::OPERATOR_CAST: {
+		auto &cast_expr = expr->Cast<CastExpression>();
+		cast_expr.child = RemapFieldReferences(std::move(cast_expr.child), projection_info);
 		return expr;
 	}
 	default:
@@ -538,18 +567,45 @@ unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &
 
 	// Transform input relation (the FROM clause)
 	if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
-		// Extract filter from Read operation if present
 		unique_ptr<ParsedExpression> filter_expr;
 		select_node->from_table = TransformReadOp(sagg.input(), &filter_expr, &projection_info);
-
-		// Apply filter as WHERE clause if present
 		if (filter_expr) {
 			auto &read_input = sagg.input().read();
 			if (read_input.has_base_schema()) {
-				// Convert positional references to column names
 				filter_expr = ConvertPositionalToColumnRef(std::move(filter_expr), read_input.base_schema());
 			}
 			select_node->where_clause = std::move(filter_expr);
+		}
+	} else if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kFilter) {
+		auto &filter = sagg.input().filter();
+		auto &filter_input = filter.input();
+		if (filter_input.rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
+			unique_ptr<ParsedExpression> read_filter_expr;
+			select_node->from_table = TransformReadOp(filter_input, &read_filter_expr, &projection_info);
+			auto &read_input = filter_input.read();
+			
+			auto top_filter_expr = TransformExpr(filter.condition());
+			top_filter_expr = RemapFieldReferences(std::move(top_filter_expr), projection_info);
+			if (read_input.has_base_schema()) {
+				top_filter_expr = ConvertPositionalToColumnRef(std::move(top_filter_expr), read_input.base_schema());
+				if (read_filter_expr) {
+					read_filter_expr = ConvertPositionalToColumnRef(std::move(read_filter_expr), read_input.base_schema());
+				}
+			}
+			if (read_filter_expr && top_filter_expr) {
+				vector<unique_ptr<ParsedExpression>> children;
+				children.push_back(std::move(read_filter_expr));
+				children.push_back(std::move(top_filter_expr));
+				select_node->where_clause = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(children));
+			} else if (read_filter_expr) {
+				select_node->where_clause = std::move(read_filter_expr);
+			} else if (top_filter_expr) {
+				select_node->where_clause = std::move(top_filter_expr);
+			}
+		} else {
+			substrait::RelRoot temp_root;
+			temp_root.mutable_input()->CopyFrom(sagg.input());
+			select_node->from_table = TransformRootOp(temp_root);
 		}
 	} else if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
 		// Nested aggregate (e.g., in scalar subqueries)
@@ -625,7 +681,13 @@ unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &
 	// Wrap in SelectStatement and SubqueryRef
 	auto select_stmt = make_uniq<SelectStatement>();
 	select_stmt->node = std::move(select_node);
-	return make_uniq<SubqueryRef>(std::move(select_stmt));
+	auto subquery_ref = make_uniq<SubqueryRef>(std::move(select_stmt));
+
+	// Generate a unique alias for the aggregate subquery (important for DuckDB binding)
+	static int agg_subquery_counter = 0;
+	subquery_ref->alias = "agg_subquery_" + std::to_string(agg_subquery_counter++);
+
+	return std::move(subquery_ref);
 }
 
 // Helper to convert PositionalReferenceExpression to ColumnRefExpression using schema
@@ -678,6 +740,13 @@ unique_ptr<ParsedExpression> SubstraitToAST::ConvertPositionalToColumnRef(unique
 		}
 		return expr;
 	}
+	case ExpressionType::COMPARE_IN: {
+		auto &op = expr->Cast<OperatorExpression>();
+		for (auto &child : op.children) {
+			child = ConvertPositionalToColumnRef(std::move(child), schema);
+		}
+		return expr;
+	}
 	case ExpressionType::FUNCTION: {
 		auto &func = expr->Cast<FunctionExpression>();
 		for (auto &child : func.children) {
@@ -692,6 +761,55 @@ unique_ptr<ParsedExpression> SubstraitToAST::ConvertPositionalToColumnRef(unique
 	}
 	default:
 		// For other expression types (constants, etc.), no conversion needed
+		return expr;
+	}
+}
+
+
+unique_ptr<ParsedExpression> SubstraitToAST::ConvertPositionalToColumnRef(unique_ptr<ParsedExpression> expr,
+                                                                           const google::protobuf::RepeatedPtrField<std::string> &names) {
+	if (!expr) {
+		return expr;
+	}
+
+	switch (expr->type) {
+	case ExpressionType::POSITIONAL_REFERENCE: {
+		auto &pos_ref = expr->Cast<PositionalReferenceExpression>();
+		idx_t field_idx = pos_ref.index - 1;
+		if (field_idx < (idx_t)names.size()) {
+			string col_name = names.Get((int)field_idx);
+			return make_uniq<ColumnRefExpression>(col_name);
+		}
+		return expr;
+	}
+	case ExpressionType::COMPARE_EQUAL:
+	case ExpressionType::COMPARE_NOTEQUAL:
+	case ExpressionType::COMPARE_LESSTHAN:
+	case ExpressionType::COMPARE_GREATERTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+	case ExpressionType::COMPARE_NOT_DISTINCT_FROM: {
+		auto &comp = expr->Cast<ComparisonExpression>();
+		comp.left = ConvertPositionalToColumnRef(std::move(comp.left), names);
+		comp.right = ConvertPositionalToColumnRef(std::move(comp.right), names);
+		return expr;
+	}
+	case ExpressionType::CONJUNCTION_AND:
+	case ExpressionType::CONJUNCTION_OR: {
+		auto &conj = expr->Cast<ConjunctionExpression>();
+		for (auto &child : conj.children) {
+			child = ConvertPositionalToColumnRef(std::move(child), names);
+		}
+		return expr;
+	}
+	case ExpressionType::FUNCTION: {
+		auto &func = expr->Cast<FunctionExpression>();
+		for (auto &child : func.children) {
+			child = ConvertPositionalToColumnRef(std::move(child), names);
+		}
+		return expr;
+	}
+	default:
 		return expr;
 	}
 }
@@ -1040,7 +1158,7 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 				select_node->where_clause = std::move(filter_expr);
 			}
 		} else if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kFilter) {
-			// Project → Filter → Read
+			// Project → Filter → Read (WHERE) or Project → Filter → Aggregate (HAVING)
 			auto &filter = project_input.filter();
 			auto &filter_input = filter.input();
 
@@ -1054,6 +1172,13 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 					filter_expr = ConvertPositionalToColumnRef(std::move(filter_expr), read_input.base_schema());
 				}
 				select_node->where_clause = std::move(filter_expr);
+			} else if (filter_input.rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
+				substrait::RelRoot temp_root;
+				temp_root.mutable_input()->CopyFrom(project_input);
+				for (int i = 0; i < sop.names_size(); i++) {
+					temp_root.add_names(sop.names(i));
+				}
+				select_node->from_table = TransformRootOp(temp_root);
 			} else {
 				throw NotImplementedException("Filter input type not yet supported: %s",
 				                            substrait::Rel::GetDescriptor()
@@ -1076,6 +1201,14 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 			substrait::RelRoot temp_root;
 			temp_root.mutable_input()->CopyFrom(project_input);
 			select_node->from_table = TransformRootOp(temp_root);
+		} else if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kFetch ||
+		           project_input.rel_type_case() == substrait::Rel::RelTypeCase::kSort) {
+			// Project → Fetch or Project → Sort
+			// Handle DataFusion patterns like Project(Fetch(Sort(Aggregate(...))))
+			// Transform the Fetch/Sort as a subquery and project from it
+			substrait::RelRoot temp_root;
+			temp_root.mutable_input()->CopyFrom(project_input);
+			select_node->from_table = TransformRootOp(temp_root);
 		} else {
 			throw NotImplementedException("Project input type not yet supported: %s",
 			                            substrait::Rel::GetDescriptor()
@@ -1084,14 +1217,12 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 		}
 
 		// Handle Project expressions and emit/outputMapping
-		// In Substrait, a Project combines input columns + computed expressions,
-		// then uses outputMapping to select which to output
+		// In Substrait, a Project's output is: [input_columns] + [computed_expressions]
+		// The outputMapping selects which of these columns to actually output
 		if (project.has_common() && project.common().has_emit() &&
 		    project.common().emit().output_mapping_size() > 0) {
-			// Has explicit outputMapping - need to build combined pool
 			auto &output_mapping = project.common().emit().output_mapping();
 
-			// Transform the computed expressions first
 			vector<unique_ptr<ParsedExpression>> computed_exprs;
 			for (auto &sexpr : project.expressions()) {
 				auto expr = TransformExpr(sexpr);
@@ -1099,11 +1230,8 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 				computed_exprs.push_back(std::move(expr));
 			}
 
-			// Determine the number of input columns from the from_table
-			// The outputMapping refers to: [input_0, ..., input_N-1, expr_0, ..., expr_M-1]
 			idx_t num_inputs = 0;
 
-			// For SubqueryRef, we can inspect the select list to count columns
 			if (select_node->from_table && select_node->from_table->type == TableReferenceType::SUBQUERY) {
 				auto &subquery_ref = select_node->from_table->Cast<SubqueryRef>();
 				if (subquery_ref.subquery && subquery_ref.subquery->node) {
@@ -1115,10 +1243,7 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 				}
 			}
 
-			// If we couldn't determine num_inputs from the subquery, fall back to heuristic
 			if (num_inputs == 0) {
-				// Compute based on max(outputMapping) - if it exceeds expression count,
-				// there must be input columns
 				int32_t max_mapping_idx = 0;
 				for (int i = 0; i < output_mapping.size(); i++) {
 					max_mapping_idx = std::max(max_mapping_idx, output_mapping.Get(i));
@@ -1128,29 +1253,29 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 				             (max_mapping_idx - num_computed + 1) : 0;
 			}
 
-			// Build the select list based on outputMapping
 			for (int i = 0; i < output_mapping.size(); i++) {
 				int32_t field_idx = output_mapping.Get(i);
 
 				if ((idx_t)field_idx < num_inputs) {
-					// References an input column (from subquery)
 					select_node->select_list.push_back(make_uniq<PositionalReferenceExpression>(field_idx + 1));
 				} else {
-					// References a computed expression
 					idx_t expr_idx = field_idx - num_inputs;
 					if (expr_idx < computed_exprs.size()) {
 						select_node->select_list.push_back(std::move(computed_exprs[expr_idx]));
-						computed_exprs[expr_idx] = nullptr; // Mark as used
+						computed_exprs[expr_idx] = nullptr;
 					}
 				}
 			}
 		} else {
-			// No outputMapping - just use the expressions directly
 			for (auto &sexpr : project.expressions()) {
 				auto expr = TransformExpr(sexpr);
 				expr = RemapFieldReferences(std::move(expr), projection_info);
 				select_node->select_list.push_back(std::move(expr));
 			}
+		}
+
+		if (select_node->select_list.empty()) {
+			select_node->select_list.push_back(make_uniq<StarExpression>());
 		}
 
 		// Add modifiers (ORDER BY, LIMIT) to the query node
@@ -1188,8 +1313,15 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 			}
 			select_node = unique_ptr<SelectNode>((SelectNode*)stmt->node.release());
 
+			// Add aliases to select list items using RelRoot names
+			for (idx_t i = 0; i < select_node->select_list.size() && i < (idx_t)sop.names_size(); i++) {
+				select_node->select_list[i]->alias = sop.names((int)i);
+			}
+
 			// Transform and apply the HAVING condition
+			// Use RelRoot names to convert positional refs to column names
 			auto having_expr = TransformExpr(filter.condition());
+			having_expr = ConvertPositionalToColumnRef(std::move(having_expr), sop.names());
 			select_node->having = std::move(having_expr);
 
 			// Add modifiers (ORDER BY, LIMIT) to the query node
