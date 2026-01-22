@@ -1,5 +1,5 @@
 # name: test/sql/test_clickbench.test
-# description: Test Substrait generation for all 43 ClickBench queries
+# description: Test Substrait roundtrip for ClickBench queries
 # group: [sql]
 
 require substrait
@@ -38,315 +38,974 @@ CREATE TABLE hits (
 )
 
 # =============================================================================
+# Insert sample data - with some duplicates to create non-tie ORDER BY results
+# =============================================================================
+
+statement ok
+INSERT INTO hits VALUES
+    (1001, 100001, '2013-07-15 10:30:00', '2013-07-15', 62, 167772161, 1, 2, 1, 6, 1920, 0, 1, 0, 0, 'https://www.referrer.com/page', 359412000017254546, 'https://www.google.com/search?q=test', 286877027035381362, 'Google Search', 'test query', 1, 'iPhone', 1024, 768),
+    (1002, 100001, '2013-07-15 10:35:00', '2013-07-15', 62, 167772161, 1, 2, 1, 6, 1920, 0, 1, 0, 0, 'https://www.referrer.com/page', 359412000017254546, 'https://www.google.com/search?q=test', 286877027035381362, 'Google Search', 'test query', 1, 'iPhone', 1024, 768),
+    (1003, 100001, '2013-07-15 10:40:00', '2013-07-15', 62, 167772161, 1, 2, 1, 6, 1920, 0, 1, 0, 0, 'https://www.referrer.com/page', 359412000017254546, 'https://www.google.com/search?q=test', 286877027035381362, 'Google Search', 'test query', 1, 'iPhone', 1024, 768),
+    (1004, 100002, '2013-07-16 11:45:00', '2013-07-16', 62, 167772162, 1, 3, 2, -1, 1280, 0, 0, 0, 0, 'https://www.facebook.com/', 359412000017254546, 'https://docs.google.com/document', 123456789012345678, 'Google Docs', 'document search', 2, 'Samsung Galaxy', 1920, 1080),
+    (1005, 100002, '2013-07-16 11:50:00', '2013-07-16', 62, 167772162, 1, 3, 2, -1, 1280, 0, 0, 0, 0, 'https://www.facebook.com/', 359412000017254546, 'https://docs.google.com/document', 123456789012345678, 'Google Docs', 'document search', 2, 'Samsung Galaxy', 1920, 1080),
+    (1006, 100003, '2013-07-17 14:20:00', '2013-07-17', 62, 167772163, 2, 0, 0, 6, 1366, 0, 1, 0, 0, 'https://www.twitter.com/', 987654321098765432, 'https://mail.google.com/inbox', 286877027035381362, 'Gmail Inbox', '', 0, '', 1366, 768),
+    (1007, 100001, '2013-07-18 09:15:00', '2013-07-18', 62, 167772164, 2, 5, 3, 6, 1920, 1, 0, 0, 0, 'https://www.linkedin.com/', 359412000017254546, 'https://www.example.com/page1', 555555555555555555, 'Example Page', 'example search', 1, 'iPhone', 1280, 720),
+    (1008, 100004, '2013-07-19 16:00:00', '2013-07-19', 100, 167772165, 3, 0, 0, 2, 1680, 0, 0, 1, 0, 'https://www.reddit.com/', 111111111111111111, 'https://www.other-site.com/path', 666666666666666666, 'Other Site', '', 3, 'Pixel', 1680, 1050),
+    (1009, 100005, '2013-07-20 12:30:00', '2013-07-20', 62, 167772166, 1, 7, 1, -1, 1920, 0, 1, 0, 0, 'https://www.github.com/', 359412000017254546, 'https://www.google.com/maps', 777777777777777777, 'Google Maps', 'maps query', 2, 'Samsung Galaxy', 1920, 1080),
+    (1010, 100006, '2013-07-21 08:45:00', '2013-07-21', 62, 167772167, 3, 2, 2, 6, 1366, 0, 0, 0, 0, 'https://www.amazon.com/', 222222222222222222, 'https://www.news-site.com/article', 888888888888888888, 'News Article', 'news search', 0, '', 1366, 768),
+    (1011, 100007, '2013-07-22 15:10:00', '2013-07-22', 50, 167772168, 2, 0, 0, 3, 1280, 1, 0, 0, 1, 'https://www.youtube.com/', 333333333333333333, 'https://www.blog.com/post', 999999999999999999, 'Blog Post', '', 1, 'iPhone', 1280, 800),
+    (1012, 100002, '2013-07-23 11:00:00', '2013-07-23', 62, 167772169, 1, 4, 1, 6, 1920, 0, 1, 0, 0, 'https://www.instagram.com/', 359412000017254546, 'https://www.google.com/images', 286877027035381362, 'Google Images', 'image search', 2, 'Samsung Galaxy', 1920, 1080)
+
+# =============================================================================
 # Q00: SELECT COUNT(*) FROM hits
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT COUNT(*) FROM hits')
+SET VARIABLE q00_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT COUNT(*) FROM hits'))
+
+statement ok
+PREPARE q00_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query I
+SELECT COUNT(*) FROM hits
+----
+12
+
+query I
+EXECUTE q00_run(getvariable('q00_plan'))
+----
+12
 
 # =============================================================================
 # Q01: SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0')
+SET VARIABLE q01_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0'))
+
+statement ok
+PREPARE q01_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query I
+SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0
+----
+9
+
+query I
+EXECUTE q01_run(getvariable('q01_plan'))
+----
+9
 
 # =============================================================================
 # Q02: SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits')
+SET VARIABLE q02_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits'))
+
+statement ok
+PREPARE q02_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query III
+SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits
+----
+30	12	1647.6666666666667
+
+query III
+EXECUTE q02_run(getvariable('q02_plan'))
+----
+30	12	1647.6666666666667
 
 # =============================================================================
 # Q03: SELECT AVG(UserID) FROM hits
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT AVG(UserID) FROM hits')
+SET VARIABLE q03_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT AVG(UserID) FROM hits'))
+
+statement ok
+PREPARE q03_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query I
+SELECT AVG(UserID) FROM hits
+----
+100002.91666666667
+
+query I
+EXECUTE q03_run(getvariable('q03_plan'))
+----
+100002.91666666667
 
 # =============================================================================
 # Q04: SELECT COUNT(DISTINCT UserID) FROM hits
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT COUNT(DISTINCT UserID) FROM hits')
+SET VARIABLE q04_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT COUNT(DISTINCT UserID) FROM hits'))
+
+statement ok
+PREPARE q04_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query I
+SELECT COUNT(DISTINCT UserID) FROM hits
+----
+7
+
+query I
+EXECUTE q04_run(getvariable('q04_plan'))
+----
+7
 
 # =============================================================================
 # Q05: SELECT COUNT(DISTINCT SearchPhrase) FROM hits
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT COUNT(DISTINCT SearchPhrase) FROM hits')
+SET VARIABLE q05_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT COUNT(DISTINCT SearchPhrase) FROM hits'))
+
+statement ok
+PREPARE q05_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query I
+SELECT COUNT(DISTINCT SearchPhrase) FROM hits
+----
+7
+
+query I
+EXECUTE q05_run(getvariable('q05_plan'))
+----
+7
 
 # =============================================================================
 # Q06: SELECT MIN(EventDate), MAX(EventDate) FROM hits
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT MIN(EventDate), MAX(EventDate) FROM hits')
+SET VARIABLE q06_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT MIN(EventDate), MAX(EventDate) FROM hits'))
+
+statement ok
+PREPARE q06_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query II
+SELECT MIN(EventDate), MAX(EventDate) FROM hits
+----
+2013-07-15	2013-07-23
+
+query II
+EXECUTE q06_run(getvariable('q06_plan'))
+----
+2013-07-15	2013-07-23
 
 # =============================================================================
 # Q07: Aggregate with GROUP BY and ORDER BY
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC')
+SET VARIABLE q07_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC'))
+
+statement ok
+PREPARE q07_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query II rowsort
+SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC
+----
+2	4
+3	2
+4	1
+5	1
+7	1
+
+query II rowsort
+EXECUTE q07_run(getvariable('q07_plan'))
+----
+2	4
+3	2
+4	1
+5	1
+7	1
 
 # =============================================================================
 # Q08: COUNT DISTINCT with GROUP BY ORDER BY LIMIT
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC LIMIT 10')
+SET VARIABLE q08_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC LIMIT 10'))
+
+statement ok
+PREPARE q08_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query II rowsort
+SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC LIMIT 10
+----
+1	3
+2	3
+3	2
+
+query II rowsort
+EXECUTE q08_run(getvariable('q08_plan'))
+----
+1	3
+2	3
+3	2
 
 # =============================================================================
 # Q09: Multiple aggregates with GROUP BY
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10')
+SET VARIABLE q09_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10'))
+
+statement ok
+PREPARE q09_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query IIIII
+SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10
+----
+1	23	7	1737.142857142857	3
+2	5	3	1522.0	3
+3	2	2	1523.0	2
+
+query IIIII
+EXECUTE q09_run(getvariable('q09_plan'))
+----
+1	23	7	1737.142857142857	3
+2	5	3	1522.0	3
+3	2	2	1523.0	2
 
 # =============================================================================
 # Q10: String comparison filter
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '''' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10')
+SET VARIABLE q10_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '''' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10'))
+
+statement ok
+PREPARE q10_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query II rowsort
+SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10
+----
+Pixel	1
+Samsung Galaxy	2
+iPhone	2
+
+query II rowsort
+EXECUTE q10_run(getvariable('q10_plan'))
+----
+Pixel	1
+Samsung Galaxy	2
+iPhone	2
 
 # =============================================================================
 # Q11: Multi-column GROUP BY
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '''' GROUP BY MobilePhone, MobilePhoneModel ORDER BY u DESC LIMIT 10')
+SET VARIABLE q11_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '''' GROUP BY MobilePhone, MobilePhoneModel ORDER BY u DESC LIMIT 10'))
+
+statement ok
+PREPARE q11_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query III rowsort
+SELECT MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhone, MobilePhoneModel ORDER BY u DESC LIMIT 10
+----
+1	iPhone	2
+2	Samsung Galaxy	2
+3	Pixel	1
+
+query III rowsort
+EXECUTE q11_run(getvariable('q11_plan'))
+----
+1	iPhone	2
+2	Samsung Galaxy	2
+3	Pixel	1
 
 # =============================================================================
 # Q12: SearchPhrase GROUP BY
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '''' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10')
+SET VARIABLE q12_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '''' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10'))
+
+statement ok
+PREPARE q12_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query II rowsort
+SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
+----
+document search	2
+example search	1
+image search	1
+maps query	1
+news search	1
+test query	3
+
+query II rowsort
+EXECUTE q12_run(getvariable('q12_plan'))
+----
+document search	2
+example search	1
+image search	1
+maps query	1
+news search	1
+test query	3
 
 # =============================================================================
 # Q13: SearchPhrase COUNT DISTINCT
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits WHERE SearchPhrase <> '''' GROUP BY SearchPhrase ORDER BY u DESC LIMIT 10')
+SET VARIABLE q13_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits WHERE SearchPhrase <> '''' GROUP BY SearchPhrase ORDER BY u DESC LIMIT 10'))
+
+statement ok
+PREPARE q13_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query II rowsort
+SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY u DESC LIMIT 10
+----
+document search	1
+example search	1
+image search	1
+maps query	1
+news search	1
+test query	1
+
+query II rowsort
+EXECUTE q13_run(getvariable('q13_plan'))
+----
+document search	1
+example search	1
+image search	1
+maps query	1
+news search	1
+test query	1
 
 # =============================================================================
 # Q14: Multi-column GROUP BY with SearchPhrase
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '''' GROUP BY SearchEngineID, SearchPhrase ORDER BY c DESC LIMIT 10')
+SET VARIABLE q14_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '''' GROUP BY SearchEngineID, SearchPhrase ORDER BY c DESC LIMIT 10'))
+
+statement ok
+PREPARE q14_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query III rowsort
+SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, SearchPhrase ORDER BY c DESC LIMIT 10
+----
+1	image search	1
+1	maps query	1
+1	test query	3
+2	document search	2
+2	news search	1
+3	example search	1
+
+query III rowsort
+EXECUTE q14_run(getvariable('q14_plan'))
+----
+1	image search	1
+1	maps query	1
+1	test query	3
+2	document search	2
+2	news search	1
+3	example search	1
 
 # =============================================================================
 # Q15: UserID GROUP BY with ORDER BY
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT UserID, COUNT(*) FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC LIMIT 10')
+SET VARIABLE q15_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT UserID, COUNT(*) FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC LIMIT 10'))
+
+statement ok
+PREPARE q15_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query II rowsort
+SELECT UserID, COUNT(*) FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC LIMIT 10
+----
+100001	4
+100002	3
+100003	1
+100004	1
+100005	1
+100006	1
+100007	1
+
+query II rowsort
+EXECUTE q15_run(getvariable('q15_plan'))
+----
+100001	4
+100002	3
+100003	1
+100004	1
+100005	1
+100006	1
+100007	1
 
 # =============================================================================
 # Q16: UserID, SearchPhrase GROUP BY
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10')
+SET VARIABLE q16_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT UserID, SearchPhrase, COUNT(*) FROM hits WHERE SearchPhrase <> '''' GROUP BY UserID, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10'))
+
+statement ok
+PREPARE q16_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query III rowsort
+SELECT UserID, SearchPhrase, COUNT(*) FROM hits WHERE SearchPhrase <> '' GROUP BY UserID, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10
+----
+100001	example search	1
+100001	test query	3
+100002	document search	2
+100002	image search	1
+100005	maps query	1
+100006	news search	1
+
+query III rowsort
+EXECUTE q16_run(getvariable('q16_plan'))
+----
+100001	example search	1
+100001	test query	3
+100002	document search	2
+100002	image search	1
+100005	maps query	1
+100006	news search	1
 
 # =============================================================================
 # Q17: GROUP BY without ORDER BY
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase LIMIT 10')
+SET VARIABLE q17_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT UserID, SearchPhrase, COUNT(*) FROM hits WHERE SearchPhrase <> '''' GROUP BY UserID, SearchPhrase LIMIT 10'))
+
+statement ok
+PREPARE q17_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query III rowsort
+SELECT UserID, SearchPhrase, COUNT(*) FROM hits WHERE SearchPhrase <> '' GROUP BY UserID, SearchPhrase LIMIT 10
+----
+100001	example search	1
+100001	test query	3
+100002	document search	2
+100002	image search	1
+100005	maps query	1
+100006	news search	1
+
+query III rowsort
+EXECUTE q17_run(getvariable('q17_plan'))
+----
+100001	example search	1
+100001	test query	3
+100002	document search	2
+100002	image search	1
+100005	maps query	1
+100006	news search	1
 
 # =============================================================================
 # Q18: EXTRACT function with GROUP BY
-# SKIP: "No expressions in groupings yet" - expressions in GROUP BY not supported
 # =============================================================================
 
-# statement ok
-# CALL get_substrait('SELECT UserID, extract(minute FROM EventTime) AS m, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, m, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10')
+statement ok
+SET VARIABLE q18_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT UserID, extract(minute FROM EventTime) AS m, SearchPhrase, COUNT(*) FROM hits WHERE SearchPhrase <> '''' GROUP BY UserID, m, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10'))
+
+statement ok
+PREPARE q18_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query IITI rowsort
+SELECT UserID, extract(minute FROM EventTime) AS m, SearchPhrase, COUNT(*) FROM hits WHERE SearchPhrase <> '' GROUP BY UserID, m, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10
+----
+100001	15	example search	1
+100001	30	test query	1
+100001	35	test query	1
+100001	40	test query	1
+100002	0	image search	1
+100002	45	document search	1
+100002	50	document search	1
+100005	30	maps query	1
+100006	45	news search	1
+
+query IITI rowsort
+EXECUTE q18_run(getvariable('q18_plan'))
+----
+100001	15	example search	1
+100001	30	test query	1
+100001	35	test query	1
+100001	40	test query	1
+100002	0	image search	1
+100002	45	document search	1
+100002	50	document search	1
+100005	30	maps query	1
+100006	45	news search	1
 
 # =============================================================================
 # Q19: Simple equality filter
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT UserID FROM hits WHERE UserID = 435090932899640449')
+SET VARIABLE q19_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT UserID FROM hits WHERE UserID = 100001'))
+
+statement ok
+PREPARE q19_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query I
+SELECT UserID FROM hits WHERE UserID = 100001
+----
+100001
+100001
+100001
+100001
+
+query I
+EXECUTE q19_run(getvariable('q19_plan'))
+----
+100001
+100001
+100001
+100001
 
 # =============================================================================
 # Q20: LIKE pattern matching
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT COUNT(*) FROM hits WHERE URL LIKE ''%google%''')
+SET VARIABLE q20_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT COUNT(*) FROM hits WHERE URL LIKE ''%google%'''))
+
+statement ok
+PREPARE q20_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query I
+SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'
+----
+8
+
+query I
+EXECUTE q20_run(getvariable('q20_plan'))
+----
+8
 
 # =============================================================================
 # Q21: LIKE with GROUP BY
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits WHERE URL LIKE ''%google%'' AND SearchPhrase <> '''' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10')
+SET VARIABLE q21_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits WHERE URL LIKE ''%google%'' AND SearchPhrase <> '''' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10'))
+
+statement ok
+PREPARE q21_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query III rowsort
+SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits WHERE URL LIKE '%google%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
+----
+document search	https://docs.google.com/document	2
+image search	https://www.google.com/images	1
+maps query	https://www.google.com/maps	1
+test query	https://www.google.com/search?q=test	3
+
+query III rowsort
+EXECUTE q21_run(getvariable('q21_plan'))
+----
+document search	https://docs.google.com/document	2
+image search	https://www.google.com/images	1
+maps query	https://www.google.com/maps	1
+test query	https://www.google.com/search?q=test	3
 
 # =============================================================================
-# Q22: LIKE and NOT LIKE combined
+# Q22: LIKE and NOT LIKE combined (empty result with our data)
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits WHERE Title LIKE ''%Google%'' AND URL NOT LIKE ''%.google.%'' AND SearchPhrase <> '''' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10')
+SET VARIABLE q22_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits WHERE Title LIKE ''%Google%'' AND URL NOT LIKE ''%.google.%'' AND SearchPhrase <> '''' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10'))
+
+statement ok
+PREPARE q22_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query IIIII
+SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
+----
+
+query IIIII
+EXECUTE q22_run(getvariable('q22_plan'))
+----
 
 # =============================================================================
-# Q23: SELECT * with LIKE and ORDER BY
-# SKIP: Internal column binding error with SELECT * and ORDER BY
+# Q23: SELECT * with ORDER BY (plan generation only - too many columns for roundtrip)
 # =============================================================================
 
-# statement ok
-# CALL get_substrait('SELECT * FROM hits WHERE URL LIKE ''%google%'' ORDER BY EventTime LIMIT 10')
+statement ok
+CALL get_substrait('SELECT * FROM hits WHERE URL LIKE ''%google%'' ORDER BY EventTime LIMIT 10')
 
 # =============================================================================
-# Q24: Simple ORDER BY
-# SKIP: Column binding error - ORDER BY column not in projection
+# Q24: ORDER BY column not in SELECT (plan generation only)
 # =============================================================================
 
-# statement ok
-# CALL get_substrait('SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '''' ORDER BY EventTime LIMIT 10')
+statement ok
+CALL get_substrait('SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '''' ORDER BY EventTime LIMIT 10')
 
 # =============================================================================
 # Q25: ORDER BY same column as SELECT
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '''' ORDER BY SearchPhrase LIMIT 10')
+SET VARIABLE q25_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '''' ORDER BY SearchPhrase LIMIT 10'))
+
+statement ok
+PREPARE q25_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query I
+SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY SearchPhrase LIMIT 10
+----
+document search
+document search
+example search
+image search
+maps query
+news search
+test query
+test query
+test query
+
+query I
+EXECUTE q25_run(getvariable('q25_plan'))
+----
+document search
+document search
+example search
+image search
+maps query
+news search
+test query
+test query
+test query
 
 # =============================================================================
-# Q26: Multi-column ORDER BY
-# SKIP: Column binding error - ORDER BY column not in projection
-# =============================================================================
-
-# statement ok
-# CALL get_substrait('SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '''' ORDER BY EventTime, SearchPhrase LIMIT 10')
-
-# =============================================================================
-# Q27: STRLEN and HAVING clause
+# Q26: Multi-column ORDER BY with column not in SELECT (plan generation only)
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT CounterID, AVG(STRLEN(URL)) AS l, COUNT(*) AS c FROM hits WHERE URL <> '''' GROUP BY CounterID HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25')
+CALL get_substrait('SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '''' ORDER BY EventTime, SearchPhrase LIMIT 10')
 
 # =============================================================================
-# Q28: REGEXP_REPLACE (complex string processing)
-# SKIP: "No expressions in groupings yet" - GROUP BY alias not supported
+# Q27: STRLEN and HAVING clause (empty result with our data)
 # =============================================================================
 
-# statement ok
-# CALL get_substrait('SELECT REGEXP_REPLACE(Referer, ''^https?://(?:www\.)?([^/]+)/.*$'', ''\1'') AS k, AVG(STRLEN(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '''' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25')
+statement ok
+SET VARIABLE q27_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT CounterID, AVG(STRLEN(URL)) AS l, COUNT(*) AS c FROM hits WHERE URL <> '''' GROUP BY CounterID HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25'))
+
+statement ok
+PREPARE q27_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query III
+SELECT CounterID, AVG(STRLEN(URL)) AS l, COUNT(*) AS c FROM hits WHERE URL <> '' GROUP BY CounterID HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25
+----
+
+query III
+EXECUTE q27_run(getvariable('q27_plan'))
+----
 
 # =============================================================================
-# Q29: Many SUM expressions
-# SKIP: Internal column binding error with expression aggregates
+# Q28: REGEXP_REPLACE in GROUP BY (plan generation - complex roundtrip)
 # =============================================================================
 
-# statement ok
-# CALL get_substrait('SELECT SUM(ResolutionWidth), SUM(ResolutionWidth + 1), SUM(ResolutionWidth + 2), SUM(ResolutionWidth + 3), SUM(ResolutionWidth + 4) FROM hits')
+statement ok
+CALL get_substrait('SELECT REGEXP_REPLACE(Referer, ''^https?://(?:www\.)?([^/]+)/.*$'', ''\1'') AS k, AVG(STRLEN(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '''' GROUP BY k HAVING COUNT(*) > 0 ORDER BY l DESC LIMIT 25')
+
+# =============================================================================
+# Q29: Multiple SUM expressions with arithmetic (plan generation - complex roundtrip)
+# =============================================================================
+
+statement ok
+CALL get_substrait('SELECT SUM(ResolutionWidth), SUM(ResolutionWidth + 1), SUM(ResolutionWidth + 2), SUM(ResolutionWidth + 3), SUM(ResolutionWidth + 4) FROM hits')
 
 # =============================================================================
 # Q30: GROUP BY with IsRefresh
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '''' GROUP BY SearchEngineID, ClientIP ORDER BY c DESC LIMIT 10')
+SET VARIABLE q30_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '''' GROUP BY SearchEngineID, ClientIP ORDER BY c DESC LIMIT 10'))
+
+statement ok
+PREPARE q30_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query IIIII rowsort
+SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, ClientIP ORDER BY c DESC LIMIT 10
+----
+1	167772161	3	0	1920.0
+1	167772166	1	0	1920.0
+1	167772169	1	0	1920.0
+2	167772162	2	0	1280.0
+2	167772167	1	0	1366.0
+3	167772164	1	1	1920.0
+
+query IIIII rowsort
+EXECUTE q30_run(getvariable('q30_plan'))
+----
+1	167772161	3	0	1920.0
+1	167772166	1	0	1920.0
+1	167772169	1	0	1920.0
+2	167772162	2	0	1280.0
+2	167772167	1	0	1366.0
+3	167772164	1	1	1920.0
 
 # =============================================================================
 # Q31: WatchID GROUP BY
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '''' GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10')
+SET VARIABLE q31_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '''' GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10'))
+
+statement ok
+PREPARE q31_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query IIIII rowsort
+SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10
+----
+1001	167772161	1	0	1920.0
+1002	167772161	1	0	1920.0
+1003	167772161	1	0	1920.0
+1004	167772162	1	0	1280.0
+1005	167772162	1	0	1280.0
+1007	167772164	1	1	1920.0
+1009	167772166	1	0	1920.0
+1010	167772167	1	0	1366.0
+1012	167772169	1	0	1920.0
+
+query IIIII rowsort
+EXECUTE q31_run(getvariable('q31_plan'))
+----
+1001	167772161	1	0	1920.0
+1002	167772161	1	0	1920.0
+1003	167772161	1	0	1920.0
+1004	167772162	1	0	1280.0
+1005	167772162	1	0	1280.0
+1007	167772164	1	1	1920.0
+1009	167772166	1	0	1920.0
+1010	167772167	1	0	1366.0
+1012	167772169	1	0	1920.0
 
 # =============================================================================
 # Q32: WatchID GROUP BY without filter
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10')
+SET VARIABLE q32_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10'))
+
+statement ok
+PREPARE q32_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query IIIII rowsort
+SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10
+----
+1001	167772161	1	0	1920.0
+1002	167772161	1	0	1920.0
+1003	167772161	1	0	1920.0
+1004	167772162	1	0	1280.0
+1005	167772162	1	0	1280.0
+1006	167772163	1	0	1366.0
+1007	167772164	1	1	1920.0
+1008	167772165	1	0	1680.0
+1009	167772166	1	0	1920.0
+1010	167772167	1	0	1366.0
+
+query IIIII rowsort
+EXECUTE q32_run(getvariable('q32_plan'))
+----
+1001	167772161	1	0	1920.0
+1002	167772161	1	0	1920.0
+1003	167772161	1	0	1920.0
+1004	167772162	1	0	1280.0
+1005	167772162	1	0	1280.0
+1006	167772163	1	0	1366.0
+1007	167772164	1	1	1920.0
+1008	167772165	1	0	1680.0
+1009	167772166	1	0	1920.0
+1010	167772167	1	0	1366.0
 
 # =============================================================================
 # Q33: URL GROUP BY
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10')
+SET VARIABLE q33_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10'))
+
+statement ok
+PREPARE q33_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query II rowsort
+SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10
+----
+https://docs.google.com/document	2
+https://mail.google.com/inbox	1
+https://www.blog.com/post	1
+https://www.example.com/page1	1
+https://www.google.com/images	1
+https://www.google.com/maps	1
+https://www.google.com/search?q=test	3
+https://www.news-site.com/article	1
+https://www.other-site.com/path	1
+
+query II rowsort
+EXECUTE q33_run(getvariable('q33_plan'))
+----
+https://docs.google.com/document	2
+https://mail.google.com/inbox	1
+https://www.blog.com/post	1
+https://www.example.com/page1	1
+https://www.google.com/images	1
+https://www.google.com/maps	1
+https://www.google.com/search?q=test	3
+https://www.news-site.com/article	1
+https://www.other-site.com/path	1
 
 # =============================================================================
-# Q34: GROUP BY with constant
-# SKIP: "No expressions in groupings yet" - constant in GROUP BY not supported
+# Q34: Constant in GROUP BY (plan generation - constant expression in GROUP BY)
 # =============================================================================
 
-# statement ok
-# CALL get_substrait('SELECT 1, URL, COUNT(*) AS c FROM hits GROUP BY 1, URL ORDER BY c DESC LIMIT 10')
+statement ok
+CALL get_substrait('SELECT 1, URL, COUNT(*) AS c FROM hits GROUP BY 1, URL ORDER BY c DESC LIMIT 10')
 
 # =============================================================================
-# Q35: Arithmetic in GROUP BY
-# SKIP: "No expressions in groupings yet" - arithmetic in GROUP BY not supported
+# Q35: Arithmetic expressions in GROUP BY (plan generation)
 # =============================================================================
 
-# statement ok
-# CALL get_substrait('SELECT ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3, COUNT(*) AS c FROM hits GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3 ORDER BY c DESC LIMIT 10')
+statement ok
+CALL get_substrait('SELECT ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3, COUNT(*) AS c FROM hits GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3 ORDER BY c DESC LIMIT 10')
 
 # =============================================================================
 # Q36: Date range filter
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> '''' GROUP BY URL ORDER BY PageViews DESC LIMIT 10')
+SET VARIABLE q36_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> '''' GROUP BY URL ORDER BY PageViews DESC LIMIT 10'))
+
+statement ok
+PREPARE q36_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query II rowsort
+SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> '' GROUP BY URL ORDER BY PageViews DESC LIMIT 10
+----
+https://docs.google.com/document	2
+https://mail.google.com/inbox	1
+https://www.google.com/images	1
+https://www.google.com/maps	1
+https://www.google.com/search?q=test	3
+https://www.news-site.com/article	1
+
+query II rowsort
+EXECUTE q36_run(getvariable('q36_plan'))
+----
+https://docs.google.com/document	2
+https://mail.google.com/inbox	1
+https://www.google.com/images	1
+https://www.google.com/maps	1
+https://www.google.com/search?q=test	3
+https://www.news-site.com/article	1
 
 # =============================================================================
 # Q37: Title GROUP BY with date filter
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT Title, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> '''' GROUP BY Title ORDER BY PageViews DESC LIMIT 10')
+SET VARIABLE q37_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT Title, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> '''' GROUP BY Title ORDER BY PageViews DESC LIMIT 10'))
+
+statement ok
+PREPARE q37_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query II rowsort
+SELECT Title, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> '' GROUP BY Title ORDER BY PageViews DESC LIMIT 10
+----
+Gmail Inbox	1
+Google Docs	2
+Google Images	1
+Google Maps	1
+Google Search	3
+News Article	1
+
+query II rowsort
+EXECUTE q37_run(getvariable('q37_plan'))
+----
+Gmail Inbox	1
+Google Docs	2
+Google Images	1
+Google Maps	1
+Google Search	3
+News Article	1
 
 # =============================================================================
-# Q38: OFFSET clause
+# Q38: OFFSET clause (empty result with our data)
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000')
+SET VARIABLE q38_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000'))
+
+statement ok
+PREPARE q38_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query II
+SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000
+----
+
+query II
+EXECUTE q38_run(getvariable('q38_plan'))
+----
 
 # =============================================================================
-# Q39: CASE expression
-# SKIP: "No expressions in groupings yet" - GROUP BY alias not supported
+# Q39: CASE expression with GROUP BY alias (plan generation)
 # =============================================================================
 
-# statement ok
-# CALL get_substrait('SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '''' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000')
+statement ok
+CALL get_substrait('SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '''' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000')
 
 # =============================================================================
 # Q40: IN clause
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT URLHash, EventDate, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465 GROUP BY URLHash, EventDate ORDER BY PageViews DESC LIMIT 10 OFFSET 100')
+SET VARIABLE q40_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT URLHash, EventDate, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 359412000017254546 GROUP BY URLHash, EventDate ORDER BY PageViews DESC LIMIT 10'))
+
+statement ok
+PREPARE q40_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query III rowsort
+SELECT URLHash, EventDate, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 359412000017254546 GROUP BY URLHash, EventDate ORDER BY PageViews DESC LIMIT 10
+----
+123456789012345678	2013-07-16	2
+286877027035381362	2013-07-15	3
+286877027035381362	2013-07-23	1
+777777777777777777	2013-07-20	1
+
+query III rowsort
+EXECUTE q40_run(getvariable('q40_plan'))
+----
+123456789012345678	2013-07-16	2
+286877027035381362	2013-07-15	3
+286877027035381362	2013-07-23	1
+777777777777777777	2013-07-20	1
 
 # =============================================================================
-# Q41: Large OFFSET
+# Q41: Large OFFSET (empty result)
 # =============================================================================
 
 statement ok
-CALL get_substrait('SELECT WindowClientWidth, WindowClientHeight, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622 GROUP BY WindowClientWidth, WindowClientHeight ORDER BY PageViews DESC LIMIT 10 OFFSET 10000')
+SET VARIABLE q41_plan = (SELECT "Plan Blob" FROM get_substrait('SELECT WindowClientWidth, WindowClientHeight, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-01'' AND EventDate <= ''2013-07-31'' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 286877027035381362 GROUP BY WindowClientWidth, WindowClientHeight ORDER BY PageViews DESC LIMIT 10 OFFSET 10000'))
+
+statement ok
+PREPARE q41_run AS SELECT * FROM from_substrait(?::BLOB)
+
+query III
+SELECT WindowClientWidth, WindowClientHeight, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 286877027035381362 GROUP BY WindowClientWidth, WindowClientHeight ORDER BY PageViews DESC LIMIT 10 OFFSET 10000
+----
+
+query III
+EXECUTE q41_run(getvariable('q41_plan'))
+----
 
 # =============================================================================
-# Q42: DATE_TRUNC in GROUP BY and ORDER BY
-# SKIP: "No expressions in groupings yet" - function in GROUP BY not supported
+# Q42: DATE_TRUNC in GROUP BY and ORDER BY (plan generation)
 # =============================================================================
 
-# statement ok
-# CALL get_substrait('SELECT DATE_TRUNC(''minute'', EventTime) AS M, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-14'' AND EventDate <= ''2013-07-15'' AND IsRefresh = 0 AND DontCountHits = 0 GROUP BY DATE_TRUNC(''minute'', EventTime) ORDER BY DATE_TRUNC(''minute'', EventTime) LIMIT 10 OFFSET 1000')
+statement ok
+CALL get_substrait('SELECT DATE_TRUNC(''minute'', EventTime) AS M, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= ''2013-07-14'' AND EventDate <= ''2013-07-15'' AND IsRefresh = 0 AND DontCountHits = 0 GROUP BY DATE_TRUNC(''minute'', EventTime) ORDER BY DATE_TRUNC(''minute'', EventTime) LIMIT 10 OFFSET 1000')
 
 # =============================================================================
 # Cleanup

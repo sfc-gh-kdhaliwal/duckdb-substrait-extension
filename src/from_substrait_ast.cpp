@@ -1337,10 +1337,11 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 
 		select_node = make_uniq<SelectNode>();
 
-		// Extract the Read's embedded filter (if it has one)
+		// Extract the Read's embedded filter and projection info
 		unique_ptr<ParsedExpression> read_filter_expr;
+		ReadProjectionInfo projection_info;
 		if (filter_input.rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
-			select_node->from_table = TransformReadOp(filter_input, &read_filter_expr);
+			select_node->from_table = TransformReadOp(filter_input, &read_filter_expr, &projection_info);
 		} else {
 			throw NotImplementedException("Filter input type not yet supported");
 		}
@@ -1348,7 +1349,11 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 		// Get the top-level filter expression
 		auto top_filter_expr = TransformExpr(filter.condition());
 
-		// Convert positional references using the Read's base_schema
+		// First remap field references through the projection (if any)
+		// This converts post-projection indices to base table indices
+		top_filter_expr = RemapFieldReferences(std::move(top_filter_expr), projection_info);
+
+		// Convert positional references to column names using the Read's base_schema
 		auto &read_input = filter_input.read();
 		if (read_input.has_base_schema()) {
 			// Convert top-level filter
@@ -1372,8 +1377,20 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 			select_node->where_clause = std::move(top_filter_expr);
 		}
 
-		// Add SELECT * for all columns
-		select_node->select_list.push_back(make_uniq<StarExpression>());
+		// Build select list based on projection info
+		if (projection_info.has_projection && read_input.has_base_schema()) {
+			auto &schema = read_input.base_schema();
+			for (auto field_idx : projection_info.field_mapping) {
+				if (field_idx < (idx_t)schema.names_size()) {
+					string col_name = schema.names((int)field_idx);
+					select_node->select_list.push_back(make_uniq<ColumnRefExpression>(col_name));
+				}
+			}
+		}
+		// Fall back to SELECT * if no projection or empty select list
+		if (select_node->select_list.empty()) {
+			select_node->select_list.push_back(make_uniq<StarExpression>());
+		}
 
 		// Add modifiers (ORDER BY, LIMIT) to the query node
 		for (auto &modifier : modifiers) {
@@ -1386,17 +1403,35 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 
 		return make_uniq<SubqueryRef>(std::move(select_stmt));
 	} else if (current_rel->rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
-		// Simple read without filter or custom projection (SELECT * FROM table)
+		// Simple read (may have embedded filter and/or projection)
 		select_node = make_uniq<SelectNode>();
 		unique_ptr<ParsedExpression> filter_expr;
+		ReadProjectionInfo projection_info;
 
-		select_node->from_table = TransformReadOp(*current_rel, &filter_expr);
+		auto &read_rel = current_rel->read();
+		select_node->from_table = TransformReadOp(*current_rel, &filter_expr, &projection_info);
+		
+		if (filter_expr && read_rel.has_base_schema()) {
+			filter_expr = ConvertPositionalToColumnRef(std::move(filter_expr), read_rel.base_schema());
+		}
 		if (filter_expr) {
 			select_node->where_clause = std::move(filter_expr);
 		}
 
-		// Add SELECT * for all columns
-		select_node->select_list.push_back(make_uniq<StarExpression>());
+		// Build select list based on projection info
+		if (projection_info.has_projection && read_rel.has_base_schema()) {
+			auto &schema = read_rel.base_schema();
+			for (auto field_idx : projection_info.field_mapping) {
+				if (field_idx < (idx_t)schema.names_size()) {
+					string col_name = schema.names((int)field_idx);
+					select_node->select_list.push_back(make_uniq<ColumnRefExpression>(col_name));
+				}
+			}
+		}
+		// Fall back to SELECT * if no projection or empty select list
+		if (select_node->select_list.empty()) {
+			select_node->select_list.push_back(make_uniq<StarExpression>());
+		}
 
 		// Add modifiers (ORDER BY, LIMIT) to the query node
 		for (auto &modifier : modifiers) {
