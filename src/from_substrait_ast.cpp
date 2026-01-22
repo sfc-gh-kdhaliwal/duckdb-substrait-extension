@@ -26,11 +26,10 @@ namespace duckdb {
 
 // Ported from legacy from_substrait.cpp - maps Substrait function names to DuckDB equivalents
 const std::unordered_map<std::string, std::string> function_names_remap = {
-    {"modulus", "mod"},      {"std_dev", "stddev"},     {"starts_with", "prefix"},
-    {"ends_with", "suffix"}, {"substring", "substr"},   {"char_length", "length"},
-    {"is_nan", "isnan"},     {"is_finite", "isfinite"}, {"is_infinite", "isinf"},
-    {"like", "~~"},          {"extract", "date_part"},  {"bitwise_and", "&"},
-    {"bitwise_or", "|"},     {"bitwise_xor", "xor"},    {"octet_length", "strlen"}};
+    {"modulus", "mod"},       {"std_dev", "stddev"},     {"starts_with", "prefix"}, {"ends_with", "suffix"},
+    {"substring", "substr"},  {"char_length", "length"}, {"is_nan", "isnan"},       {"is_finite", "isfinite"},
+    {"is_infinite", "isinf"}, {"extract", "date_part"},  {"bitwise_and", "&"},      {"bitwise_or", "|"},
+    {"bitwise_xor", "xor"},   {"octet_length", "strlen"}};
 
 SubstraitToAST::SubstraitToAST(ClientContext &context_p, const string &serialized, bool json) : context(context_p) {
 	if (!json) {
@@ -243,6 +242,26 @@ unique_ptr<ParsedExpression> SubstraitToAST::TransformScalarFunctionExpr(const s
 			throw InvalidInputException("not function requires exactly 1 argument");
 		}
 		return make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(children[0]));
+	} else if (function_name == "like") {
+		// Emit correct DuckDB function based on argument count
+		if (children.size() == 2) {
+			// 2-arg LIKE: use ~~ operator
+			return make_uniq<FunctionExpression>("~~", std::move(children));
+		} else if (children.size() == 3) {
+			// 3-arg LIKE: check if escape is NULL
+			auto const_expr = dynamic_cast<ConstantExpression *>(children[2].get());
+			if (const_expr && const_expr->value.IsNull()) {
+				// NULL escape: drop 3rd argument, use 2-arg ~~
+				children.pop_back();
+				return make_uniq<FunctionExpression>("~~", std::move(children));
+			} else {
+				// Non-NULL escape: use like_escape
+				return make_uniq<FunctionExpression>("like_escape", std::move(children));
+			}
+		} else {
+			throw InvalidInputException("like function requires 2 or 3 arguments, got " +
+			                            std::to_string(children.size()));
+		}
 	} else if (function_name == "is_not_distinct_from") {
 		if (children.size() != 2) {
 			throw InvalidInputException("is_not_distinct_from function requires exactly 2 arguments");
