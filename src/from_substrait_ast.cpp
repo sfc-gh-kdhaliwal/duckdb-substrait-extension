@@ -127,6 +127,8 @@ Value SubstraitToAST::TransformLiteralToValue(const substrait::Expression_Litera
 	}
 	case substrait::Expression_Literal::LiteralTypeCase::kVarChar:
 		return {literal.var_char().value()};
+	case substrait::Expression_Literal::LiteralTypeCase::kFixedChar:
+		return {literal.fixed_char()};
 	default:
 		throw NotImplementedException(
 		    "Literal type not yet implemented in AST transformer: %s",
