@@ -42,8 +42,7 @@ private:
 	//! Transform Substrait Read operation to TableRef
 	//! If filter_out is provided, any embedded filter will be extracted
 	//! If projection_info is provided, projection mapping information will be returned
-	unique_ptr<TableRef> TransformReadOp(const substrait::Rel &sop,
-	                                     unique_ptr<ParsedExpression> *filter_out = nullptr,
+	unique_ptr<TableRef> TransformReadOp(const substrait::Rel &sop, unique_ptr<ParsedExpression> *filter_out = nullptr,
 	                                     ReadProjectionInfo *projection_info = nullptr);
 
 	//! Transform Substrait Read operation for use in joins
@@ -83,14 +82,15 @@ private:
 
 	//! Helper to remap field references based on Read projection
 	unique_ptr<ParsedExpression> RemapFieldReferences(unique_ptr<ParsedExpression> expr,
-	                                                    const ReadProjectionInfo &projection_info);
+	                                                  const ReadProjectionInfo &projection_info);
 
 	//! Helper to convert positional references to column references
 	unique_ptr<ParsedExpression> ConvertPositionalToColumnRef(unique_ptr<ParsedExpression> expr,
-	                                                           const substrait::NamedStruct &schema);
+	                                                          const substrait::NamedStruct &schema);
 
-	unique_ptr<ParsedExpression> ConvertPositionalToColumnRef(unique_ptr<ParsedExpression> expr,
-	                                                           const google::protobuf::RepeatedPtrField<std::string> &names);
+	unique_ptr<ParsedExpression>
+	ConvertPositionalToColumnRef(unique_ptr<ParsedExpression> expr,
+	                             const google::protobuf::RepeatedPtrField<std::string> &names);
 
 	//! Helper functions
 	string FindFunction(uint64_t id);

@@ -703,25 +703,31 @@ substrait::Expression *DuckDBToSubstrait::TransformIsNullFilter(uint64_t col_idx
 	return s_expr;
 }
 
-substrait::Expression *DuckDBToSubstrait::TransformStructExtractFilter(uint64_t col_idx, const LogicalType &column_type, const TableFilter &dfilter, const LogicalType &return_type) {
+substrait::Expression *DuckDBToSubstrait::TransformStructExtractFilter(uint64_t col_idx, const LogicalType &column_type,
+                                                                       const TableFilter &dfilter,
+                                                                       const LogicalType &return_type) {
 	auto &struct_filter = dfilter.Cast<StructFilter>();
 
 	// Create a field reference to the child_idx within the struct
 	auto s_field_ref = new substrait::Expression();
 	auto selection = new substrait::Expression_FieldReference();
-	selection->mutable_direct_reference()->mutable_struct_field()->set_field(static_cast<int32_t>(struct_filter.child_idx));
+	selection->mutable_direct_reference()->mutable_struct_field()->set_field(
+	    static_cast<int32_t>(struct_filter.child_idx));
 	auto root_reference = new substrait::Expression_FieldReference_RootReference();
 	selection->set_allocated_root_reference(root_reference);
 	s_field_ref->set_allocated_selection(selection);
 
 	// Now, apply the child filter to this new field reference
-	// The col_idx for the recursive call should be 0 because s_field_ref is now the "root" of the expression for the child filter
+	// The col_idx for the recursive call should be 0 because s_field_ref is now the "root" of the expression for the
+	// child filter
 	return TransformFilter(0, StructType::GetChildType(column_type, struct_filter.child_idx),
 	                       *struct_filter.child_filter, return_type);
 }
 
-substrait::Expression *DuckDBToSubstrait::TransformConjunctionAndFilter(uint64_t col_idx, const LogicalType &column_type,
-                                                                       const TableFilter &dfilter, const LogicalType &return_type) {
+substrait::Expression *DuckDBToSubstrait::TransformConjunctionAndFilter(uint64_t col_idx,
+                                                                        const LogicalType &column_type,
+                                                                        const TableFilter &dfilter,
+                                                                        const LogicalType &return_type) {
 	auto &conjunction_filter = dfilter.Cast<ConjunctionAndFilter>();
 	return CreateConjunction(conjunction_filter.child_filters, [&](const unique_ptr<TableFilter> &in) {
 		return TransformFilter(col_idx, column_type, *in, return_type);
@@ -729,11 +735,13 @@ substrait::Expression *DuckDBToSubstrait::TransformConjunctionAndFilter(uint64_t
 }
 
 substrait::Expression *DuckDBToSubstrait::TransformConjunctionOrFilter(uint64_t col_idx, const LogicalType &column_type,
-                                                                      const TableFilter &dfilter, const LogicalType &return_type) {
+                                                                       const TableFilter &dfilter,
+                                                                       const LogicalType &return_type) {
 	auto &conjunction_filter = dfilter.Cast<ConjunctionOrFilter>();
-	return CreateConjunction(conjunction_filter.child_filters, [&](const unique_ptr<TableFilter> &in) {
-		return TransformFilter(col_idx, column_type, *in, return_type);
-	}, "or");
+	return CreateConjunction(
+	    conjunction_filter.child_filters,
+	    [&](const unique_ptr<TableFilter> &in) { return TransformFilter(col_idx, column_type, *in, return_type); },
+	    "or");
 }
 
 substrait::Expression *DuckDBToSubstrait::TransformConstantComparisonFilter(uint64_t col_idx,
@@ -783,7 +791,8 @@ substrait::Expression *DuckDBToSubstrait::TransformConstantComparisonFilter(uint
 }
 
 substrait::Expression *DuckDBToSubstrait::TransformInFilter(uint64_t col_idx, const LogicalType &column_type,
-                                                            const TableFilter &dfilter, const LogicalType &return_type) {
+                                                            const TableFilter &dfilter,
+                                                            const LogicalType &return_type) {
 	auto s_expr = new substrait::Expression();
 	auto &in_filter = dfilter.Cast<InFilter>();
 	auto singular_or_list = s_expr->mutable_singular_or_list();
@@ -792,14 +801,16 @@ substrait::Expression *DuckDBToSubstrait::TransformInFilter(uint64_t col_idx, co
 	CreateFieldRef(singular_or_list->mutable_value(), col_idx);
 
 	// Add the options (the values in the IN list)
-	        for (auto &constant_value : in_filter.values) {
+	for (auto &constant_value : in_filter.values) {
 		TransformConstant(constant_value, *singular_or_list->add_options());
 	}
 
 	return s_expr;
 }
 
-substrait::Expression *DuckDBToSubstrait::TransformDynamicFilter(uint64_t col_idx, const LogicalType &column_type, const TableFilter &dfilter, const LogicalType &return_type) {
+substrait::Expression *DuckDBToSubstrait::TransformDynamicFilter(uint64_t col_idx, const LogicalType &column_type,
+                                                                 const TableFilter &dfilter,
+                                                                 const LogicalType &return_type) {
 	auto &dynamic_filter = dfilter.Cast<DynamicFilter>();
 	if (!dynamic_filter.filter_data || !dynamic_filter.filter_data->filter) {
 		throw InternalException("Dynamic filter data or inner filter is null");
@@ -808,7 +819,9 @@ substrait::Expression *DuckDBToSubstrait::TransformDynamicFilter(uint64_t col_id
 	return TransformConstantComparisonFilter(col_idx, column_type, *dynamic_filter.filter_data->filter, return_type);
 }
 
-substrait::Expression *DuckDBToSubstrait::TransformExpressionFilter(uint64_t col_idx, const LogicalType &column_type, const TableFilter &dfilter, const LogicalType &return_type) {
+substrait::Expression *DuckDBToSubstrait::TransformExpressionFilter(uint64_t col_idx, const LogicalType &column_type,
+                                                                    const TableFilter &dfilter,
+                                                                    const LogicalType &return_type) {
 	auto s_expr = new substrait::Expression();
 	auto &expr_filter = dfilter.Cast<ExpressionFilter>();
 
@@ -842,11 +855,10 @@ substrait::Expression *DuckDBToSubstrait::TransformFilter(uint64_t col_idx, cons
 		return TransformIsNullFilter(col_idx, column_type, dfilter, return_type);
 	case TableFilterType::OPTIONAL_FILTER:
 		return nullptr;
-        case TableFilterType::STRUCT_EXTRACT:
+	case TableFilterType::STRUCT_EXTRACT:
 		return TransformStructExtractFilter(col_idx, column_type, dfilter, return_type);
-        default:
-		throw NotImplementedException("Unsupported table filter type: %s",
-			EnumUtil::ToString(dfilter.filter_type));
+	default:
+		throw NotImplementedException("Unsupported table filter type: %s", EnumUtil::ToString(dfilter.filter_type));
 	}
 }
 

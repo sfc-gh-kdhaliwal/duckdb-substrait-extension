@@ -183,7 +183,8 @@ static void VerifySubstraitRoundtrip(unique_ptr<LogicalOperator> &query_plan, Cl
 				auto &stream_query = substrait_result->Cast<StreamQueryResult>();
 				substrait_materialized = stream_query.Materialize();
 			} else {
-				substrait_materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(substrait_result));
+				substrait_materialized =
+				    unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(substrait_result));
 			}
 		} else {
 			// Use prepared statement for binary blob input (more efficient than hex encoding!)
@@ -195,7 +196,8 @@ static void VerifySubstraitRoundtrip(unique_ptr<LogicalOperator> &query_plan, Cl
 				auto &stream_query = substrait_result->Cast<StreamQueryResult>();
 				substrait_materialized = stream_query.Materialize();
 			} else {
-				substrait_materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(substrait_result));
+				substrait_materialized =
+				    unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(substrait_result));
 			}
 		}
 
@@ -310,7 +312,7 @@ static unique_ptr<TableRef> SubstraitBindReplace(ClientContext &context, TableFu
 	SubstraitToAST transformer(context, serialized, is_json);
 	auto table_ref = transformer.TransformPlanToTableRef();
 
-	return table_ref;  // ✅ Returns AST directly - DuckDB will bind it in the outer query context
+	return table_ref; // ✅ Returns AST directly - DuckDB will bind it in the outer query context
 }
 
 static unique_ptr<TableRef> FromSubstraitBindReplace(ClientContext &context, TableFunctionBindInput &input) {
