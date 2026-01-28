@@ -21,7 +21,6 @@
 #include "duckdb/common/exception.hpp"
 
 #include "google/protobuf/util/json_util.h"
-#include "absl/status/status.h"
 
 namespace duckdb {
 
@@ -38,9 +37,9 @@ SubstraitToAST::SubstraitToAST(ClientContext &context_p, const string &serialize
 			throw std::runtime_error("Could not parse binary Substrait plan");
 		}
 	} else {
-		absl::Status status = google::protobuf::util::JsonStringToMessage(serialized, &plan);
+		auto status = google::protobuf::util::JsonStringToMessage(serialized, &plan);
 		if (!status.ok()) {
-			throw std::runtime_error("Could not parse JSON Substrait plan: " + std::string(status.ToString()));
+			throw std::runtime_error("Could not parse JSON Substrait plan: " + status.ToString());
 		}
 	}
 

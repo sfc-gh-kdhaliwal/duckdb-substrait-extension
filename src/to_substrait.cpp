@@ -20,7 +20,6 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "google/protobuf/util/json_util.h"
-#include "absl/status/status.h"
 #include "substrait/algebra.pb.h"
 #include "substrait/plan.pb.h"
 
@@ -1143,7 +1142,7 @@ void PrintRelAsJson(substrait::Rel *rel) {
 	static int i;
 	std::string json_output;
 	google::protobuf::util::JsonPrintOptions options;
-	options.add_whitespace = false;                     // Pretty-print with indentation
+	options.add_whitespace = false;                      // Pretty-print with indentation
 	options.always_print_fields_with_no_presence = true; // Print even if default values
 
 	auto status = google::protobuf::util::MessageToJsonString(*rel, &json_output, options);
