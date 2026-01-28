@@ -86,121 +86,106 @@ target_include_directories(${EXTENSION_NAME} PRIVATE
 )
 
 # ============================================================================
-# Link protobuf and abseil using file paths (Delta extension pattern)
+# Link protobuf and abseil using $<TARGET_FILE:> generator expressions
 # ============================================================================
 # CMake's export system requires all target_link_libraries dependencies to be
 # exportable. FetchContent-built libraries are NOT in the export set.
 #
-# Solution: Link to the protobuf/abseil static libraries using FILE PATHs (strings),
-# not CMake targets. This is the same pattern used by the delta extension
-# for linking to delta-kernel-rs. CMake doesn't track string paths as target
-# dependencies, so no export issues arise.
+# Solution: Use $<TARGET_FILE:target> generator expressions to get library file
+# paths. This breaks the CMake target dependency graph while still:
+# 1. Using the correct library files (auto-discovered from targets)
+# 2. Automatically handling library locations across platforms
+# 3. Getting transitive dependencies resolved correctly
+#
+# The key insight: $<TARGET_FILE:target> is evaluated at generate-time to produce
+# a plain file path string. CMake does NOT track this as a target dependency
+# for export purposes.
 
-# Ensure protobuf is built first
+# ============================================================================
+# Helper function: Recursively collect all library files from target deps
+# ============================================================================
+# This handles both direct and transitive abseil dependencies by walking the
+# INTERFACE_LINK_LIBRARIES and LINK_LIBRARIES properties of each target.
+
+function(get_real_target target out_var)
+    if(NOT TARGET ${target})
+        set(${out_var} "" PARENT_SCOPE)
+        return()
+    endif()
+    get_target_property(_aliased ${target} ALIASED_TARGET)
+    if(_aliased)
+        set(${out_var} ${_aliased} PARENT_SCOPE)
+    else()
+        set(${out_var} ${target} PARENT_SCOPE)
+    endif()
+endfunction()
+
+function(collect_target_files seed_targets out_var)
+    set(_result "")
+    set(_visited "")
+    set(_queue ${seed_targets})
+    
+    while(_queue)
+        list(POP_FRONT _queue _current)
+        
+        # Skip if already visited or not a target
+        if(_current IN_LIST _visited)
+            continue()
+        endif()
+        list(APPEND _visited ${_current})
+        
+        # Resolve alias to real target
+        get_real_target(${_current} _real)
+        if(NOT _real)
+            continue()
+        endif()
+        
+        # Get target type
+        get_target_property(_type ${_real} TYPE)
+        
+        # If it's a real library (not INTERFACE), add its file path
+        if(_type STREQUAL "STATIC_LIBRARY" OR _type STREQUAL "SHARED_LIBRARY" OR _type STREQUAL "MODULE_LIBRARY")
+            list(APPEND _result "$<TARGET_FILE:${_current}>")
+        endif()
+        
+        # Queue dependencies from INTERFACE_LINK_LIBRARIES
+        get_target_property(_iface_deps ${_real} INTERFACE_LINK_LIBRARIES)
+        if(_iface_deps)
+            foreach(_dep IN LISTS _iface_deps)
+                if(TARGET ${_dep})
+                    list(APPEND _queue ${_dep})
+                endif()
+            endforeach()
+        endif()
+        
+        # Queue dependencies from LINK_LIBRARIES (non-interface)
+        get_target_property(_link_deps ${_real} LINK_LIBRARIES)
+        if(_link_deps)
+            foreach(_dep IN LISTS _link_deps)
+                if(TARGET ${_dep})
+                    list(APPEND _queue ${_dep})
+                endif()
+            endforeach()
+        endif()
+    endwhile()
+    
+    list(REMOVE_DUPLICATES _result)
+    set(${out_var} ${_result} PARENT_SCOPE)
+endfunction()
+
+# ============================================================================
+# Collect all protobuf and abseil library files
+# ============================================================================
+# Start with protobuf's libprotobuf and utf8_validity, plus all abseil targets
+# that protobuf declares it needs (${protobuf_ABSL_USED_TARGETS})
+
+set(_seed_targets libprotobuf utf8_validity ${protobuf_ABSL_USED_TARGETS})
+collect_target_files("${_seed_targets}" PROTOBUF_ABSEIL_LIBS)
+
+message(STATUS "Collected ${CMAKE_MATCH_COUNT} protobuf/abseil libraries via TARGET_FILE resolution")
+
+# Ensure build order - protobuf (and transitively abseil) must be built first
 add_dependencies(${EXTENSION_NAME} libprotobuf)
-
-# Determine library suffix based on platform
-if(WIN32)
-    set(LIB_SUFFIX ".lib")
-else()
-    set(LIB_SUFFIX ".a")
-endif()
-
-# Set base paths for libraries
-set(PROTOBUF_BUILD_DIR "${CMAKE_BINARY_DIR}/_deps/protobuf-build")
-set(ABSEIL_BUILD_DIR "${CMAKE_BINARY_DIR}/_deps/abseil-build")
-
-# Protobuf library
-set(PROTOBUF_LIB_PATH "${PROTOBUF_BUILD_DIR}/libprotobuf${LIB_SUFFIX}")
-
-# Abseil libraries required by protobuf (order matters due to dependencies)
-# These are needed because protobuf 29.x uses abseil internally
-set(ABSEIL_LIBS
-    # Status (required by protobuf's json functions)
-    "${ABSEIL_BUILD_DIR}/absl/status/libabsl_status${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/status/libabsl_statusor${LIB_SUFFIX}"
-    # Strings and Cord (heavily used by protobuf)
-    "${ABSEIL_BUILD_DIR}/absl/strings/libabsl_strings${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/strings/libabsl_strings_internal${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/strings/libabsl_str_format_internal${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/strings/libabsl_string_view${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/strings/libabsl_cord${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/strings/libabsl_cord_internal${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/strings/libabsl_cordz_functions${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/strings/libabsl_cordz_handle${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/strings/libabsl_cordz_info${LIB_SUFFIX}"
-    # Synchronization (Mutex, etc.)
-    "${ABSEIL_BUILD_DIR}/absl/synchronization/libabsl_synchronization${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/synchronization/libabsl_graphcycles_internal${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/synchronization/libabsl_kernel_timeout_internal${LIB_SUFFIX}"
-    # Containers (raw_hash_set used by protobuf)
-    "${ABSEIL_BUILD_DIR}/absl/container/libabsl_raw_hash_set${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/container/libabsl_hashtablez_sampler${LIB_SUFFIX}"
-    # Hash
-    "${ABSEIL_BUILD_DIR}/absl/hash/libabsl_hash${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/hash/libabsl_city${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/hash/libabsl_low_level_hash${LIB_SUFFIX}"
-    # Time
-    "${ABSEIL_BUILD_DIR}/absl/time/libabsl_time${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/time/libabsl_time_zone${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/time/libabsl_civil_time${LIB_SUFFIX}"
-    # CRC (used by Cord)
-    "${ABSEIL_BUILD_DIR}/absl/crc/libabsl_crc32c${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/crc/libabsl_crc_cord_state${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/crc/libabsl_crc_internal${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/crc/libabsl_crc_cpu_detect${LIB_SUFFIX}"
-    # Debugging/Profiling
-    "${ABSEIL_BUILD_DIR}/absl/debugging/libabsl_stacktrace${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/debugging/libabsl_symbolize${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/debugging/libabsl_debugging_internal${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/debugging/libabsl_demangle_internal${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/debugging/libabsl_demangle_rust${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/debugging/libabsl_decode_rust_punycode${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/debugging/libabsl_utf8_for_code_point${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/debugging/libabsl_examine_stack${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/debugging/libabsl_leak_check${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/profiling/libabsl_exponential_biased${LIB_SUFFIX}"
-    # Base types
-    "${ABSEIL_BUILD_DIR}/absl/types/libabsl_bad_optional_access${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/types/libabsl_bad_variant_access${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/numeric/libabsl_int128${LIB_SUFFIX}"
-    # Log (required by protobuf for CHECK/LOG macros)
-    "${ABSEIL_BUILD_DIR}/absl/log/libabsl_log_internal_message${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/log/libabsl_log_internal_check_op${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/log/libabsl_log_internal_conditions${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/log/libabsl_log_internal_nullguard${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/log/libabsl_log_internal_format${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/log/libabsl_log_internal_globals${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/log/libabsl_log_internal_proto${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/log/libabsl_log_internal_log_sink_set${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/log/libabsl_log_internal_fnmatch${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/log/libabsl_log_entry${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/log/libabsl_log_globals${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/log/libabsl_log_initialize${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/log/libabsl_log_sink${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/log/libabsl_die_if_null${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/log/libabsl_vlog_config_internal${LIB_SUFFIX}"
-    # Flags (used by some logging functions)
-    "${ABSEIL_BUILD_DIR}/absl/flags/libabsl_flags_internal${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/flags/libabsl_flags_reflection${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/flags/libabsl_flags_config${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/flags/libabsl_flags_program_name${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/flags/libabsl_flags_commandlineflag${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/flags/libabsl_flags_commandlineflag_internal${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/flags/libabsl_flags_marshalling${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/flags/libabsl_flags_private_handle_accessor${LIB_SUFFIX}"
-    # Base (commonly used)
-    "${ABSEIL_BUILD_DIR}/absl/base/libabsl_base${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/base/libabsl_raw_logging_internal${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/base/libabsl_spinlock_wait${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/base/libabsl_throw_delegate${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/base/libabsl_strerror${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/base/libabsl_log_severity${LIB_SUFFIX}"
-    "${ABSEIL_BUILD_DIR}/absl/base/libabsl_malloc_internal${LIB_SUFFIX}"
-)
-
-# UTF8 validity library (part of protobuf, used for string validation)
-set(UTF8_VALIDITY_LIB "${PROTOBUF_BUILD_DIR}/third_party/utf8_range/libutf8_validity${LIB_SUFFIX}")
 
 # On macOS, abseil's time_zone library requires CoreFoundation
 if(APPLE)
@@ -210,11 +195,9 @@ else()
     set(PLATFORM_LIBS "")
 endif()
 
-# Link using file path strings (not CMake targets) - avoids export dependency
+# Link using $<TARGET_FILE:> expressions - breaks CMake target graph for exports
 target_link_libraries(${EXTENSION_NAME} PRIVATE 
-    "${PROTOBUF_LIB_PATH}"
-    "${UTF8_VALIDITY_LIB}"
-    ${ABSEIL_LIBS}
+    ${PROTOBUF_ABSEIL_LIBS}
     ${PLATFORM_LIBS}
 )
 
@@ -232,11 +215,12 @@ if(COMMAND build_loadable_extension)
       ${abseil_SOURCE_DIR}
   )
   
-  # Link protobuf and abseil libraries to the loadable extension (plain signature to match DuckDB)
+  # Ensure loadable extension waits for protobuf build
+  add_dependencies(${TARGET_NAME}_loadable_extension libprotobuf)
+  
+  # Link protobuf and abseil libraries using the same TARGET_FILE approach
   target_link_libraries(${TARGET_NAME}_loadable_extension
-      "${PROTOBUF_LIB_PATH}"
-      "${UTF8_VALIDITY_LIB}"
-      ${ABSEIL_LIBS}
+      ${PROTOBUF_ABSEIL_LIBS}
       ${PLATFORM_LIBS}
   )
   
