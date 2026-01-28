@@ -31,7 +31,7 @@ set(PROTO_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 # Create OBJECT library for proto files (Ninja-safe parallel compilation)
 add_library(substrait_proto OBJECT ${PROTO_FILES})
-target_link_libraries(substrait_proto PUBLIC protobuf::libprotobuf)
+target_link_libraries(substrait_proto PRIVATE protobuf::libprotobuf)
 target_include_directories(substrait_proto 
     PUBLIC ${PROTO_OUT_DIR} ${protobuf_SOURCE_DIR}/src)
 
@@ -56,7 +56,7 @@ set(EXTENSION_SOURCES
 add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES})
 
 # Link against substrait proto library and protobuf
-target_link_libraries(${EXTENSION_NAME} PUBLIC substrait_proto protobuf::libprotobuf)
+target_link_libraries(${EXTENSION_NAME} PRIVATE substrait_proto protobuf::libprotobuf)
 
 # Include generated headers and protobuf headers
 target_include_directories(${EXTENSION_NAME} PRIVATE ${PROTO_OUT_DIR} ${protobuf_SOURCE_DIR}/src)
@@ -64,7 +64,6 @@ target_include_directories(${EXTENSION_NAME} PRIVATE ${PROTO_OUT_DIR} ${protobuf
 set(PARAMETERS "-warnings")
 if(COMMAND build_loadable_extension)
   build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${EXTENSION_SOURCES})
-  target_link_libraries(${TARGET_NAME} PUBLIC substrait_proto)
   
   if(DEFINED ENV{SKIP_SUBSTRAIT_C_TESTS})
     message(STATUS "Skipping substrait c tests")
@@ -73,8 +72,16 @@ if(COMMAND build_loadable_extension)
   endif()
 endif()
 
-install(
-  TARGETS ${EXTENSION_NAME}
-  EXPORT "${DUCKDB_EXPORT_SET}"
-  LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
-  ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+if(NOT COMMAND build_loadable_extension)
+  install(
+    TARGETS ${EXTENSION_NAME}
+    EXPORT "${DUCKDB_EXPORT_SET}"
+    LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+    ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+else()
+  # When building as a DuckDB extension, install without export
+  install(
+    TARGETS ${EXTENSION_NAME}
+    LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+    ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+endif()
