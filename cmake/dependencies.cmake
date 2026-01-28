@@ -4,6 +4,15 @@
 include(FetchContent)
 
 # ============================================================================
+# C++ Standard Override
+# ============================================================================
+# DuckDB uses C++11, but modern protobuf (22.x+) and abseil require C++14/17.
+# We override the C++ standard for our dependencies and extension.
+# This is ABI-compatible since we only use DuckDB's C++11-compatible public API.
+set(CMAKE_CXX_STANDARD 17 CACHE STRING "" FORCE)
+set(CMAKE_CXX_STANDARD_REQUIRED ON CACHE BOOL "" FORCE)
+
+# ============================================================================
 # Abseil - Required by modern protobuf
 # ============================================================================
 set(ABSL_VERSION "20240722.0")  # LTS version compatible with protobuf 29.x
