@@ -37,7 +37,7 @@ SubstraitToAST::SubstraitToAST(ClientContext &context_p, const string &serialize
 			throw std::runtime_error("Could not parse binary Substrait plan");
 		}
 	} else {
-		google::protobuf::util::Status status = google::protobuf::util::JsonStringToMessage(serialized, &plan);
+		auto status = google::protobuf::util::JsonStringToMessage(serialized, &plan);
 		if (!status.ok()) {
 			throw std::runtime_error("Could not parse JSON Substrait plan: " + status.ToString());
 		}

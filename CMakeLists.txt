@@ -5,114 +5,240 @@ set(TARGET_NAME substrait)
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 project(${TARGET_NAME})
+
+# Include external dependencies (protobuf via FetchContent)
+include(cmake/dependencies.cmake)
+
 include_directories(src/include)
 
-include_directories(third_party/substrait)
-include_directories(third_party/)
+# ============================================================================
+# Protobuf Generation - Generate .pb.cc/.pb.h files at build time
+# ============================================================================
+set(PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/substrait/proto)
+set(PROTO_FILES
+    ${PROTO_DIR}/substrait/algebra.proto
+    ${PROTO_DIR}/substrait/capabilities.proto
+    ${PROTO_DIR}/substrait/extended_expression.proto
+    ${PROTO_DIR}/substrait/function.proto
+    ${PROTO_DIR}/substrait/parameterized_types.proto
+    ${PROTO_DIR}/substrait/plan.proto
+    ${PROTO_DIR}/substrait/type.proto
+    ${PROTO_DIR}/substrait/type_expressions.proto
+    ${PROTO_DIR}/substrait/extensions/extensions.proto
+)
 
-set(PROTOBUF_SOURCES
-    third_party/google/protobuf/any.cc
-    third_party/google/protobuf/any.pb.cc
-    third_party/google/protobuf/any_lite.cc
-    third_party/google/protobuf/arena.cc
-    third_party/google/protobuf/arenastring.cc
-    third_party/google/protobuf/descriptor.cc
-    third_party/google/protobuf/descriptor.pb.cc
-    third_party/google/protobuf/descriptor_database.cc
-    third_party/google/protobuf/dynamic_message.cc
-    third_party/google/protobuf/empty.pb.cc
-    third_party/google/protobuf/extension_set.cc
-    third_party/google/protobuf/extension_set_heavy.cc
-    third_party/google/protobuf/generated_enum_util.cc
-    third_party/google/protobuf/generated_message_bases.cc
-    third_party/google/protobuf/generated_message_reflection.cc
-    third_party/google/protobuf/generated_message_table_driven.cc
-    third_party/google/protobuf/generated_message_table_driven_lite.cc
-    third_party/google/protobuf/generated_message_util.cc
-    third_party/google/protobuf/implicit_weak_message.cc
-    third_party/google/protobuf/inlined_string_field.cc
-    third_party/google/protobuf/map.cc
-    third_party/google/protobuf/map_field.cc
-    third_party/google/protobuf/message.cc
-    third_party/google/protobuf/message_lite.cc
-    third_party/google/protobuf/parse_context.cc
-    third_party/google/protobuf/port_def.inc
-    third_party/google/protobuf/port_undef.inc
-    third_party/google/protobuf/reflection_ops.cc
-    third_party/google/protobuf/repeated_field.cc
-    third_party/google/protobuf/repeated_ptr_field.cc
-    third_party/google/protobuf/text_format.cc
-    third_party/google/protobuf/unknown_field_set.cc
-    third_party/google/protobuf/wire_format.cc
-    third_party/google/protobuf/wire_format_lite.cc
-    third_party/google/protobuf/io/coded_stream.cc
-    third_party/google/protobuf/io/io_win32.cc
-    third_party/google/protobuf/io/strtod.cc
-    third_party/google/protobuf/io/tokenizer.cc
-    third_party/google/protobuf/io/zero_copy_stream.cc
-    third_party/google/protobuf/io/zero_copy_stream_impl.cc
-    third_party/google/protobuf/io/zero_copy_stream_impl_lite.cc
-    third_party/google/protobuf/stubs/common.cc
-    third_party/google/protobuf/stubs/int128.cc
-    third_party/google/protobuf/stubs/status.cc
-    third_party/google/protobuf/stubs/stringpiece.cc
-    third_party/google/protobuf/stubs/stringprintf.cc
-    third_party/google/protobuf/stubs/structurally_valid.cc
-    third_party/google/protobuf/stubs/strutil.cc
-    third_party/google/protobuf/stubs/substitute.cc
-    third_party/google/protobuf/stubs/bytestream.cc
-    third_party/google/protobuf/util/json_util.cc
-    third_party/google/protobuf/util/internal/datapiece.cc
-    third_party/google/protobuf/util/internal/default_value_objectwriter.cc
-    third_party/google/protobuf/util/internal/error_listener.cc
-    third_party/google/protobuf/util/internal/json_escaping.cc
-    third_party/google/protobuf/util/internal/json_objectwriter.cc
-    third_party/google/protobuf/util/internal/json_stream_parser.cc
-    third_party/google/protobuf/util/json_util.cc
-    third_party/google/protobuf/util/internal/object_writer.cc
-    third_party/google/protobuf/util/internal/proto_writer.cc
-    third_party/google/protobuf/util/internal/protostream_objectsource.cc
-    third_party/google/protobuf/util/internal/protostream_objectwriter.cc
-    third_party/google/protobuf/source_context.pb.cc
-    third_party/google/protobuf/stubs/statusor.cc
-    third_party/google/protobuf/stubs/time.cc
-    third_party/google/protobuf/type.pb.cc
-    third_party/google/protobuf/wrappers.pb.cc
-    third_party/google/protobuf/struct.pb.cc
-    third_party/google/protobuf/util/internal/type_info.cc
-    third_party/google/protobuf/util/internal/field_mask_utility.cc
-    third_party/google/protobuf/util/type_resolver_util.cc
-    third_party/google/protobuf/util/internal/utility.cc)
+set(PROTO_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
-set(SUBSTRAIT_SOURCES
-    third_party/substrait/substrait/algebra.pb.cc
-    third_party/substrait/substrait/capabilities.pb.cc
-    third_party/substrait/substrait/function.pb.cc
-    third_party/substrait/substrait/parameterized_types.pb.cc
-    third_party/substrait/substrait/plan.pb.cc
-    third_party/substrait/substrait/type.pb.cc
-    third_party/substrait/substrait/type_expressions.pb.cc
-    third_party/substrait/substrait/extensions/extensions.pb.cc)
+# Ensure the output directory exists (protoc doesn't create it automatically)
+file(MAKE_DIRECTORY ${PROTO_OUT_DIR})
+file(MAKE_DIRECTORY ${PROTO_OUT_DIR}/substrait)
+file(MAKE_DIRECTORY ${PROTO_OUT_DIR}/substrait/extensions)
 
+# Create OBJECT library for proto files (Ninja-safe parallel compilation)
+add_library(substrait_proto OBJECT ${PROTO_FILES})
+target_link_libraries(substrait_proto PRIVATE protobuf::libprotobuf)
+target_include_directories(substrait_proto 
+    PUBLIC ${PROTO_OUT_DIR} ${protobuf_SOURCE_DIR}/src)
+
+# Ensure proto library uses C++17 (required by protobuf/abseil)
+set_target_properties(substrait_proto PROPERTIES 
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
+
+# Generate C++ code from .proto files
+protobuf_generate(
+    TARGET substrait_proto
+    LANGUAGE cpp
+    IMPORT_DIRS ${PROTO_DIR} ${protobuf_SOURCE_DIR}/src
+    PROTOC_OUT_DIR ${PROTO_OUT_DIR}
+)
+
+# ============================================================================
+# Extension Library
+# ============================================================================
 set(EXTENSION_SOURCES
     src/to_substrait.cpp
     src/from_substrait_ast.cpp
     src/substrait_extension.cpp
     src/custom_extensions.cpp
-    src/custom_extensions_generated.cpp
-    ${SUBSTRAIT_SOURCES}
-    ${PROTOBUF_SOURCES})
+    src/custom_extensions_generated.cpp)
 
-add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES})
+# Include proto object files directly using $<TARGET_OBJECTS:>
+# This includes the compiled .o files without creating a CMake target dependency
+add_library(${EXTENSION_NAME} STATIC 
+    ${EXTENSION_SOURCES}
+    $<TARGET_OBJECTS:substrait_proto>
+)
 
-set(PARAMETERS "-warnings")
-build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${EXTENSION_SOURCES})
-if(DEFINED ENV{SKIP_SUBSTRAIT_C_TESTS})
-  message(STATUS "Skipping substrait c tests")
+# Ensure extension uses C++17 (required by protobuf/abseil headers)
+set_target_properties(${EXTENSION_NAME} PROPERTIES 
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
+
+# Include generated headers, protobuf headers, and abseil headers
+# Abseil headers are required because protobuf headers include them
+target_include_directories(${EXTENSION_NAME} PRIVATE 
+    ${PROTO_OUT_DIR} 
+    ${protobuf_SOURCE_DIR}/src
+    ${abseil_SOURCE_DIR}
+)
+
+# ============================================================================
+# Link protobuf and abseil using $<TARGET_FILE:> generator expressions
+# ============================================================================
+# CMake's export system requires all target_link_libraries dependencies to be
+# exportable. FetchContent-built libraries are NOT in the export set.
+#
+# Solution: Use $<TARGET_FILE:target> generator expressions to get library file
+# paths. This breaks the CMake target dependency graph while still:
+# 1. Using the correct library files (auto-discovered from targets)
+# 2. Automatically handling library locations across platforms
+# 3. Getting transitive dependencies resolved correctly
+#
+# The key insight: $<TARGET_FILE:target> is evaluated at generate-time to produce
+# a plain file path string. CMake does NOT track this as a target dependency
+# for export purposes.
+
+# ============================================================================
+# Helper function: Recursively collect all library files from target deps
+# ============================================================================
+# This handles both direct and transitive abseil dependencies by walking the
+# INTERFACE_LINK_LIBRARIES and LINK_LIBRARIES properties of each target.
+
+function(get_real_target target out_var)
+    if(NOT TARGET ${target})
+        set(${out_var} "" PARENT_SCOPE)
+        return()
+    endif()
+    get_target_property(_aliased ${target} ALIASED_TARGET)
+    if(_aliased)
+        set(${out_var} ${_aliased} PARENT_SCOPE)
+    else()
+        set(${out_var} ${target} PARENT_SCOPE)
+    endif()
+endfunction()
+
+function(collect_target_files seed_targets out_var)
+    set(_result "")
+    set(_visited "")
+    set(_queue ${seed_targets})
+    
+    while(_queue)
+        list(POP_FRONT _queue _current)
+        
+        # Skip if already visited or not a target
+        if(_current IN_LIST _visited)
+            continue()
+        endif()
+        list(APPEND _visited ${_current})
+        
+        # Resolve alias to real target
+        get_real_target(${_current} _real)
+        if(NOT _real)
+            continue()
+        endif()
+        
+        # Get target type
+        get_target_property(_type ${_real} TYPE)
+        
+        # If it's a real library (not INTERFACE), add its file path
+        if(_type STREQUAL "STATIC_LIBRARY" OR _type STREQUAL "SHARED_LIBRARY" OR _type STREQUAL "MODULE_LIBRARY")
+            list(APPEND _result "$<TARGET_FILE:${_current}>")
+        endif()
+        
+        # Queue dependencies from INTERFACE_LINK_LIBRARIES
+        get_target_property(_iface_deps ${_real} INTERFACE_LINK_LIBRARIES)
+        if(_iface_deps)
+            foreach(_dep IN LISTS _iface_deps)
+                if(TARGET ${_dep})
+                    list(APPEND _queue ${_dep})
+                endif()
+            endforeach()
+        endif()
+        
+        # Queue dependencies from LINK_LIBRARIES (non-interface)
+        get_target_property(_link_deps ${_real} LINK_LIBRARIES)
+        if(_link_deps)
+            foreach(_dep IN LISTS _link_deps)
+                if(TARGET ${_dep})
+                    list(APPEND _queue ${_dep})
+                endif()
+            endforeach()
+        endif()
+    endwhile()
+    
+    list(REMOVE_DUPLICATES _result)
+    set(${out_var} ${_result} PARENT_SCOPE)
+endfunction()
+
+# ============================================================================
+# Collect all protobuf and abseil library files
+# ============================================================================
+# Start with protobuf's libprotobuf and utf8_validity, plus all abseil targets
+# that protobuf declares it needs (${protobuf_ABSL_USED_TARGETS})
+
+set(_seed_targets libprotobuf utf8_validity ${protobuf_ABSL_USED_TARGETS})
+collect_target_files("${_seed_targets}" PROTOBUF_ABSEIL_LIBS)
+
+message(STATUS "Collected ${CMAKE_MATCH_COUNT} protobuf/abseil libraries via TARGET_FILE resolution")
+
+# Ensure build order - protobuf (and transitively abseil) must be built first
+add_dependencies(${EXTENSION_NAME} libprotobuf)
+
+# On macOS, abseil's time_zone library requires CoreFoundation
+if(APPLE)
+    find_library(COREFOUNDATION_LIBRARY CoreFoundation REQUIRED)
+    set(PLATFORM_LIBS ${COREFOUNDATION_LIBRARY})
 else()
-  add_subdirectory("test/c")
+    set(PLATFORM_LIBS "")
 endif()
 
+# Link using $<TARGET_FILE:> expressions - breaks CMake target graph for exports
+target_link_libraries(${EXTENSION_NAME} PRIVATE 
+    ${PROTOBUF_ABSEIL_LIBS}
+    ${PLATFORM_LIBS}
+)
+
+set(PARAMETERS "-warnings")
+if(COMMAND build_loadable_extension)
+  build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${EXTENSION_SOURCES})
+  
+  # Add protobuf objects to the loadable extension
+  target_sources(${TARGET_NAME}_loadable_extension PRIVATE $<TARGET_OBJECTS:substrait_proto>)
+  
+  # Configure includes and libraries for the loadable extension
+  target_include_directories(${TARGET_NAME}_loadable_extension PRIVATE 
+      ${PROTO_OUT_DIR} 
+      ${protobuf_SOURCE_DIR}/src
+      ${abseil_SOURCE_DIR}
+  )
+  
+  # Ensure loadable extension waits for protobuf build
+  add_dependencies(${TARGET_NAME}_loadable_extension libprotobuf)
+  
+  # Link protobuf and abseil libraries using the same TARGET_FILE approach
+  target_link_libraries(${TARGET_NAME}_loadable_extension
+      ${PROTOBUF_ABSEIL_LIBS}
+      ${PLATFORM_LIBS}
+  )
+  
+  # Ensure C++17 for the loadable extension
+  set_target_properties(${TARGET_NAME}_loadable_extension PROPERTIES 
+      CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON
+  )
+  
+  if(DEFINED ENV{SKIP_SUBSTRAIT_C_TESTS})
+    message(STATUS "Skipping substrait c tests")
+  else()
+    add_subdirectory("test/c")
+  endif()
+endif()
+
+# Install with export - required because DuckDB links substrait_extension
+# into duckdb_static which is exported
 install(
   TARGETS ${EXTENSION_NAME}
   EXPORT "${DUCKDB_EXPORT_SET}"
