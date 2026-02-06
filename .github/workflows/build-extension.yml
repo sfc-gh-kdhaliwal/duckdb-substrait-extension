@@ -2,7 +2,7 @@ name: Build DuckDB Substrait Extension
 
 on:
   push:
-    branches: [ main, substrat_1.4.2_complete_rewrite ]
+    branches: [ main, substrat_1.4.2_complete_rewrite, upgrade_duckdb_to_1.4.4 ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:  # Allows manual triggering from GitHub UI
@@ -10,10 +10,10 @@ on:
       duckdb_version:
         description: 'DuckDB version to build against'
         required: false
-        default: 'v1.4.2'
+        default: 'v1.4.4'
 
 env:
-  DUCKDB_VERSION: v1.4.2
+  DUCKDB_VERSION: v1.4.4
 
 jobs:
   build-linux-amd64:
