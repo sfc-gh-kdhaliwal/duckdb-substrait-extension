@@ -1065,8 +1065,27 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 			select_node->from_table = TransformRootOp(temp_root);
 		} else if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kFetch ||
 		           project_input.rel_type_case() == substrait::Rel::RelTypeCase::kSort) {
+			// When Project wraps Fetch(Sort(...)), peel the Fetch as an outer
+			// LIMIT modifier so DuckDB can fuse Sort+Limit into TopN.
+			// Without this, both Fetch and Sort end up inside a subquery and
+			// DuckDB produces STREAMING_LIMIT + ORDER_BY (wrong execution order).
+			const substrait::Rel *inner = &project_input;
+			if (inner->rel_type_case() == substrait::Rel::RelTypeCase::kFetch) {
+				auto &fetch = inner->fetch();
+				if (fetch.input().rel_type_case() == substrait::Rel::RelTypeCase::kSort) {
+					auto limit_mod = make_uniq<LimitModifier>();
+					if (fetch.count() != -1) {
+						limit_mod->limit = make_uniq<ConstantExpression>(Value::BIGINT(fetch.count()));
+					}
+					if (fetch.offset() > 0) {
+						limit_mod->offset = make_uniq<ConstantExpression>(Value::BIGINT(fetch.offset()));
+					}
+					modifiers.push_back(std::move(limit_mod));
+					inner = &fetch.input();
+				}
+			}
 			substrait::RelRoot temp_root;
-			temp_root.mutable_input()->CopyFrom(project_input);
+			temp_root.mutable_input()->CopyFrom(*inner);
 			for (int i = 0; i < sop.names_size(); i++) {
 				temp_root.add_names(sop.names(i));
 			}
