@@ -93,6 +93,11 @@ private:
 
 	//! Function registry
 	unordered_map<uint64_t, string> functions_map;
+
+	//! Column names from the most recently encountered ReadRel base_schema.
+	//! Used by TransformSelectionExpr to emit ColumnRefExpression for virtual
+	//! columns (e.g. rowid) that have no physical position in DuckDB.
+	vector<string> current_base_schema_names;
 };
 
 } // namespace duckdb

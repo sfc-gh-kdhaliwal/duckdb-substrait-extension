@@ -144,8 +144,19 @@ unique_ptr<ParsedExpression> SubstraitToAST::TransformSelectionExpr(const substr
 		throw SyntaxException("Can only have direct struct references in selections");
 	}
 
-	// Use positional reference (1-based in DuckDB)
 	auto field_idx = sexpr.selection().direct_reference().struct_field().field();
+
+	// If we have schema names and this field maps to a known name, use a named
+	// reference.  This is required for virtual columns like "rowid" that DuckDB
+	// exposes but that have no physical ordinal position in the table.
+	if (field_idx < current_base_schema_names.size()) {
+		const auto &col_name = current_base_schema_names[field_idx];
+		if (col_name == "rowid") {
+			return make_uniq<ColumnRefExpression>(col_name);
+		}
+	}
+
+	// Use positional reference (1-based in DuckDB)
 	return make_uniq<PositionalReferenceExpression>(field_idx + 1);
 }
 
@@ -445,6 +456,14 @@ unique_ptr<TableRef> SubstraitToAST::TransformReadOp(const substrait::Rel &sop,
                                                      unique_ptr<ParsedExpression> *filter_out) {
 	auto &sget = sop.read();
 
+	if (sget.has_base_schema()) {
+		current_base_schema_names.clear();
+		const auto &schema = sget.base_schema();
+		for (int i = 0; i < schema.names_size(); i++) {
+			current_base_schema_names.push_back(schema.names(i));
+		}
+	}
+
 	// Extract filter if present (will be added as WHERE clause by caller)
 	if (filter_out && sget.has_filter()) {
 		*filter_out = TransformExpr(sget.filter());
@@ -706,6 +725,15 @@ SubstraitToAST::ConvertPositionalToColumnRef(unique_ptr<ParsedExpression> expr,
 
 unique_ptr<TableRef> SubstraitToAST::TransformReadWithProjection(const substrait::Rel &sop) {
 	auto &sget = sop.read();
+
+	// Capture column names so TransformSelectionExpr can resolve virtual columns.
+	if (sget.has_base_schema()) {
+		current_base_schema_names.clear();
+		const auto &schema = sget.base_schema();
+		for (int i = 0; i < schema.names_size(); i++) {
+			current_base_schema_names.push_back(schema.names(i));
+		}
+	}
 
 	// Check if the Read has a projection or filter
 	bool has_projection = sget.has_projection();
