@@ -24,6 +24,15 @@
 
 namespace duckdb {
 
+// Apply modifiers (ORDER BY, LIMIT) to a SelectNode in reverse order.
+// Substrait plans are traversed outer-to-inner, but SQL semantics require
+// inner-to-outer application (ORDER BY before LIMIT).
+static void ApplyModifiers(vector<unique_ptr<ResultModifier>> &modifiers, SelectNode &select_node) {
+	for (auto it = modifiers.rbegin(); it != modifiers.rend(); ++it) {
+		select_node.modifiers.push_back(std::move(*it));
+	}
+}
+
 // Ported from legacy from_substrait.cpp - maps Substrait function names to DuckDB equivalents
 const std::unordered_map<std::string, std::string> function_names_remap = {
     {"modulus", "mod"},       {"std_dev", "stddev"},     {"starts_with", "prefix"}, {"ends_with", "suffix"},
@@ -1065,30 +1074,10 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 			select_node->from_table = TransformRootOp(temp_root);
 		} else if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kFetch ||
 		           project_input.rel_type_case() == substrait::Rel::RelTypeCase::kSort) {
-			// When Project wraps Fetch(Sort(...)), peel the Fetch as an outer
-			// LIMIT modifier so DuckDB can fuse Sort+Limit into TopN.
-			// Without this, both Fetch and Sort end up inside a subquery and
-			// DuckDB produces STREAMING_LIMIT + ORDER_BY (wrong execution order).
-			const substrait::Rel *inner = &project_input;
-			if (inner->rel_type_case() == substrait::Rel::RelTypeCase::kFetch) {
-				auto &fetch = inner->fetch();
-				if (fetch.input().rel_type_case() == substrait::Rel::RelTypeCase::kSort) {
-					auto limit_mod = make_uniq<LimitModifier>();
-					if (fetch.count() != -1) {
-						limit_mod->limit = make_uniq<ConstantExpression>(Value::BIGINT(fetch.count()));
-					}
-					if (fetch.offset() > 0) {
-						limit_mod->offset = make_uniq<ConstantExpression>(Value::BIGINT(fetch.offset()));
-					}
-					modifiers.push_back(std::move(limit_mod));
-					inner = &fetch.input();
-				}
-			}
+			// Fetch/Sort inside Project - handle via standard recursion
+			// The reverse-iteration fix ensures correct modifier ordering
 			substrait::RelRoot temp_root;
-			temp_root.mutable_input()->CopyFrom(*inner);
-			for (int i = 0; i < sop.names_size(); i++) {
-				temp_root.add_names(sop.names(i));
-			}
+			temp_root.mutable_input()->CopyFrom(project_input);
 			select_node->from_table = TransformRootOp(temp_root);
 		} else {
 			throw NotImplementedException(
@@ -1154,10 +1143,7 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 			select_node->select_list.push_back(make_uniq<StarExpression>());
 		}
 
-		// Add modifiers (ORDER BY, LIMIT) to the query node
-		for (auto &modifier : modifiers) {
-			select_node->modifiers.push_back(std::move(modifier));
-		}
+		ApplyModifiers(modifiers, *select_node);
 
 		// Wrap in SelectStatement and SubqueryRef
 		auto select_stmt = make_uniq<SelectStatement>();
@@ -1199,10 +1185,7 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 			having_expr = ConvertPositionalToColumnRef(std::move(having_expr), sop.names());
 			select_node->having = std::move(having_expr);
 
-			// Add modifiers (ORDER BY, LIMIT) to the query node
-			for (auto &modifier : modifiers) {
-				select_node->modifiers.push_back(std::move(modifier));
-			}
+			ApplyModifiers(modifiers, *select_node);
 
 			// Wrap in SelectStatement and SubqueryRef
 			auto new_stmt = make_uniq<SelectStatement>();
@@ -1223,9 +1206,7 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 
 		select_node->select_list.push_back(make_uniq<StarExpression>());
 
-		for (auto &modifier : modifiers) {
-			select_node->modifiers.push_back(std::move(modifier));
-		}
+		ApplyModifiers(modifiers, *select_node);
 
 		auto select_stmt = make_uniq<SelectStatement>();
 		select_stmt->node = std::move(select_node);
@@ -1237,9 +1218,7 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 		select_node->select_list.push_back(make_uniq<StarExpression>());
 
 		// Add modifiers (ORDER BY, LIMIT) to the query node
-		for (auto &modifier : modifiers) {
-			select_node->modifiers.push_back(std::move(modifier));
-		}
+		ApplyModifiers(modifiers, *select_node);
 
 		// Wrap in SelectStatement and SubqueryRef
 		auto select_stmt = make_uniq<SelectStatement>();
@@ -1257,9 +1236,7 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 			select_node->select_list.push_back(make_uniq<StarExpression>());
 
 			// Add modifiers
-			for (auto &modifier : modifiers) {
-				select_node->modifiers.push_back(std::move(modifier));
-			}
+			ApplyModifiers(modifiers, *select_node);
 
 			auto select_stmt = make_uniq<SelectStatement>();
 			select_stmt->node = std::move(select_node);
@@ -1277,9 +1254,7 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 			select_node->from_table = std::move(join_ref);
 			select_node->select_list.push_back(make_uniq<StarExpression>());
 
-			for (auto &modifier : modifiers) {
-				select_node->modifiers.push_back(std::move(modifier));
-			}
+			ApplyModifiers(modifiers, *select_node);
 
 			auto select_stmt = make_uniq<SelectStatement>();
 			select_stmt->node = std::move(select_node);
@@ -1304,9 +1279,7 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 			select_node->from_table = std::move(cross_ref);
 			select_node->select_list.push_back(make_uniq<StarExpression>());
 
-			for (auto &modifier : modifiers) {
-				select_node->modifiers.push_back(std::move(modifier));
-			}
+			ApplyModifiers(modifiers, *select_node);
 
 			auto select_stmt = make_uniq<SelectStatement>();
 			select_stmt->node = std::move(select_node);
@@ -1330,9 +1303,7 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 			select_node->from_table = std::move(set_ref);
 			select_node->select_list.push_back(make_uniq<StarExpression>());
 
-			for (auto &modifier : modifiers) {
-				select_node->modifiers.push_back(std::move(modifier));
-			}
+			ApplyModifiers(modifiers, *select_node);
 
 			auto select_stmt = make_uniq<SelectStatement>();
 			select_stmt->node = std::move(select_node);
