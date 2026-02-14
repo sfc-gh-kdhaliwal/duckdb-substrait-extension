@@ -739,7 +739,9 @@ unique_ptr<TableRef> SubstraitToAST::TransformReadWithProjection(const substrait
 	}
 
 	// Add projected columns to select list using column names from base schema
-	if (has_projection && sget.has_base_schema()) {
+	// Treat empty projection (struct_items_size == 0) as "select all" since it means
+	// no columns were explicitly requested (e.g., COUNT(*) query)
+	if (has_projection && sget.has_base_schema() && sget.projection().select().struct_items_size() > 0) {
 		const auto &projection = sget.projection().select();
 		const auto &schema = sget.base_schema();
 
@@ -757,7 +759,7 @@ unique_ptr<TableRef> SubstraitToAST::TransformReadWithProjection(const substrait
 			}
 		}
 	} else {
-		// No projection, select all columns
+		// No projection or empty projection, select all columns
 		select_node->select_list.push_back(make_uniq<StarExpression>());
 	}
 
@@ -1005,14 +1007,38 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 			auto limit_modifier = make_uniq<LimitModifier>();
 			auto &fetch = current_rel->fetch();
 
-			// Handle limit (-1 means no limit)
-			if (fetch.count() != -1) {
-				limit_modifier->limit = make_uniq<ConstantExpression>(Value::BIGINT(fetch.count()));
+			// Handle limit - supports both deprecated count and new count_expr
+			switch (fetch.count_mode_case()) {
+			case substrait::FetchRel::CountModeCase::kCount:
+				// Deprecated: direct integer count (-1 means no limit)
+				if (fetch.count() != -1) {
+					limit_modifier->limit = make_uniq<ConstantExpression>(Value::BIGINT(fetch.count()));
+				}
+				break;
+			case substrait::FetchRel::CountModeCase::kCountExpr:
+				// New: count as expression (must be a literal for now)
+				limit_modifier->limit = TransformExpr(fetch.count_expr());
+				break;
+			default:
+				// No count specified - means ALL records
+				break;
 			}
 
-			// Handle offset
-			if (fetch.offset() > 0) {
-				limit_modifier->offset = make_uniq<ConstantExpression>(Value::BIGINT(fetch.offset()));
+			// Handle offset - supports both deprecated offset and new offset_expr
+			switch (fetch.offset_mode_case()) {
+			case substrait::FetchRel::OffsetModeCase::kOffset:
+				// Deprecated: direct integer offset
+				if (fetch.offset() > 0) {
+					limit_modifier->offset = make_uniq<ConstantExpression>(Value::BIGINT(fetch.offset()));
+				}
+				break;
+			case substrait::FetchRel::OffsetModeCase::kOffsetExpr:
+				// New: offset as expression (must be a literal for now)
+				limit_modifier->offset = TransformExpr(fetch.offset_expr());
+				break;
+			default:
+				// No offset specified - means 0
+				break;
 			}
 
 			modifiers.push_back(std::move(limit_modifier));
