@@ -42,6 +42,10 @@ private:
 	//! Transform Substrait Aggregate operation to TableRef
 	unique_ptr<TableRef> TransformAggregateOp(const substrait::Rel &sop);
 
+	//! Transform Substrait Aggregate operation to raw SelectNode (without SubqueryRef wrapping)
+	//! Used for inlining aggregates into projections to enable DuckDB optimizer rules
+	unique_ptr<SelectNode> TransformAggregateOpRaw(const substrait::Rel &sop);
+
 	//! Transform Substrait Join operation to TableRef
 	unique_ptr<TableRef> TransformJoinOp(const substrait::Rel &sop);
 

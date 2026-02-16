@@ -277,6 +277,26 @@ unique_ptr<ParsedExpression> SubstraitToAST::TransformScalarFunctionExpr(const s
 		}
 		return make_uniq<ComparisonExpression>(ExpressionType::COMPARE_NOT_DISTINCT_FROM, std::move(children[0]),
 		                                       std::move(children[1]));
+	} else if (function_name == "add") {
+		if (children.size() != 2) {
+			throw InvalidInputException("add function requires exactly 2 arguments");
+		}
+		return make_uniq<FunctionExpression>("+", std::move(children));
+	} else if (function_name == "subtract") {
+		if (children.size() != 2) {
+			throw InvalidInputException("subtract function requires exactly 2 arguments");
+		}
+		return make_uniq<FunctionExpression>("-", std::move(children));
+	} else if (function_name == "multiply") {
+		if (children.size() != 2) {
+			throw InvalidInputException("multiply function requires exactly 2 arguments");
+		}
+		return make_uniq<FunctionExpression>("*", std::move(children));
+	} else if (function_name == "divide") {
+		if (children.size() != 2) {
+			throw InvalidInputException("divide function requires exactly 2 arguments");
+		}
+		return make_uniq<FunctionExpression>("/", std::move(children));
 	}
 
 	// For all other functions, create a FunctionExpression
@@ -495,7 +515,7 @@ unique_ptr<TableRef> SubstraitToAST::TransformReadOp(const substrait::Rel &sop,
 	return base_ref;
 }
 
-unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &sop) {
+unique_ptr<SelectNode> SubstraitToAST::TransformAggregateOpRaw(const substrait::Rel &sop) {
 	auto &sagg = sop.aggregate();
 	auto select_node = make_uniq<SelectNode>();
 
@@ -514,8 +534,6 @@ unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &
 			select_node->from_table = TransformRootOp(temp_root);
 		}
 	} else if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
-		// Nested aggregate (e.g., in scalar subqueries)
-		// Wrap in RelRoot and transform recursively
 		substrait::RelRoot temp_root;
 		temp_root.mutable_input()->CopyFrom(sagg.input());
 		select_node->from_table = TransformRootOp(temp_root);
@@ -523,7 +541,6 @@ unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &
 	           sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kJoin ||
 	           sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kSort ||
 	           sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kFetch) {
-		// Wrap in RelRoot and transform recursively (same pattern as in TransformJoinOp)
 		substrait::RelRoot temp_root;
 		temp_root.mutable_input()->CopyFrom(sagg.input());
 		select_node->from_table = TransformRootOp(temp_root);
@@ -533,27 +550,22 @@ unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &
 		    substrait::Rel::GetDescriptor()->FindFieldByNumber(sagg.input().rel_type_case())->name());
 	}
 
-	// Transform GROUP BY expressions
 	if (sagg.groupings_size() > 0) {
 		for (auto &sgrp : sagg.groupings()) {
 			for (auto &sgrpexpr : sgrp.grouping_expressions()) {
 				auto group_expr = TransformExpr(sgrpexpr);
-				// Add to both select list and group expressions
 				select_node->select_list.push_back(group_expr->Copy());
 				select_node->groups.group_expressions.push_back(std::move(group_expr));
 			}
 		}
 	}
 
-	// Transform aggregate functions (measures)
 	for (auto &smeas : sagg.measures()) {
 		auto &s_aggr_function = smeas.measure();
 
-		// Check for DISTINCT aggregation
 		bool is_distinct = s_aggr_function.invocation() ==
 		                   substrait::AggregateFunction_AggregationInvocation_AGGREGATION_INVOCATION_DISTINCT;
 
-		// Transform aggregate arguments
 		vector<unique_ptr<ParsedExpression>> children;
 		for (auto &sarg : s_aggr_function.arguments()) {
 			if (sarg.has_value()) {
@@ -562,27 +574,28 @@ unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &
 			}
 		}
 
-		// Get function name
 		auto function_name = FindFunction(s_aggr_function.function_reference());
 		function_name = RemoveFunctionExtension(function_name);
 
-		// Special case: count with no arguments becomes count_star
 		if (function_name == "count" && children.empty()) {
 			function_name = "count_star";
 		}
 
-		// Create aggregate function expression
 		auto agg_expr =
 		    make_uniq<FunctionExpression>(function_name, std::move(children), nullptr, nullptr, is_distinct);
 		select_node->select_list.push_back(std::move(agg_expr));
 	}
 
-	// Wrap in SelectStatement and SubqueryRef
+	return select_node;
+}
+
+unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &sop) {
+	auto select_node = TransformAggregateOpRaw(sop);
+
 	auto select_stmt = make_uniq<SelectStatement>();
 	select_stmt->node = std::move(select_node);
 	auto subquery_ref = make_uniq<SubqueryRef>(std::move(select_stmt));
 
-	// Generate a unique alias for the aggregate subquery (important for DuckDB binding)
 	static int agg_subquery_counter = 0;
 	subquery_ref->alias = "agg_subquery_" + std::to_string(agg_subquery_counter++);
 
@@ -1089,7 +1102,68 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 			// Project → Cross (cross join/Cartesian product)
 			select_node->from_table = TransformCrossProductOp(project_input);
 		} else if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
-			// Project → Aggregate (could happen with aggregate queries)
+			// Project → Aggregate: Check if this is a simple passthrough projection
+			// that just selects aggregate outputs without computing new expressions.
+			// If so, inline the aggregate to enable DuckDB's SUM_REWRITER optimization.
+			auto &agg = project_input.aggregate();
+			idx_t num_agg_outputs = agg.measures_size();
+			for (auto &grp : agg.groupings()) {
+				num_agg_outputs += grp.grouping_expressions_size();
+			}
+
+			bool is_passthrough = true;
+
+			// Check output mapping: must select exactly the computed expressions (not input columns)
+			if (project.has_common() && project.common().has_emit() &&
+			    project.common().emit().output_mapping_size() > 0) {
+				auto &output_mapping = project.common().emit().output_mapping();
+				idx_t num_project_exprs = project.expressions_size();
+
+				// For passthrough, output_mapping should select indices [num_agg_outputs, num_agg_outputs + num_project_exprs)
+				// which are the computed expressions in Substrait's output model
+				if ((idx_t)output_mapping.size() != num_project_exprs) {
+					is_passthrough = false;
+				} else {
+					for (int i = 0; i < output_mapping.size() && is_passthrough; i++) {
+						if ((idx_t)output_mapping.Get(i) != num_agg_outputs + (idx_t)i) {
+							is_passthrough = false;
+						}
+					}
+				}
+			}
+
+			// Check project expressions: must be simple field references to aggregate outputs
+			if (is_passthrough && (idx_t)project.expressions_size() == num_agg_outputs) {
+				for (int i = 0; i < project.expressions_size() && is_passthrough; i++) {
+					auto &expr = project.expressions(i);
+					if (!expr.has_selection() || !expr.selection().has_direct_reference() ||
+					    !expr.selection().has_root_reference()) {
+						is_passthrough = false;
+					} else {
+						auto &field_ref = expr.selection().direct_reference();
+						if (!field_ref.has_struct_field()) {
+							is_passthrough = false;
+						} else {
+							int32_t field_idx = field_ref.struct_field().field();
+							if (field_idx != i) {
+								is_passthrough = false;
+							}
+						}
+					}
+				}
+			} else if (is_passthrough) {
+				is_passthrough = false;
+			}
+
+			if (is_passthrough && modifiers.empty()) {
+				// Inline the aggregate directly - no subquery wrapping needed
+				auto agg_select_node = TransformAggregateOpRaw(project_input);
+				auto select_stmt = make_uniq<SelectStatement>();
+				select_stmt->node = std::move(agg_select_node);
+				return make_uniq<SubqueryRef>(std::move(select_stmt));
+			}
+
+			// Fall back to standard handling with subquery
 			select_node->from_table = TransformAggregateOp(project_input);
 		} else if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kProject) {
 			substrait::RelRoot temp_root;
