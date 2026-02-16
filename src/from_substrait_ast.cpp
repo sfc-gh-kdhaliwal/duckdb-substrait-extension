@@ -1,5 +1,7 @@
 #include "from_substrait_ast.hpp"
 
+#include <atomic>
+
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
@@ -277,7 +279,15 @@ unique_ptr<ParsedExpression> SubstraitToAST::TransformScalarFunctionExpr(const s
 		}
 		return make_uniq<ComparisonExpression>(ExpressionType::COMPARE_NOT_DISTINCT_FROM, std::move(children[0]),
 		                                       std::move(children[1]));
-	} else if (function_name == "add") {
+	}
+	// NOTE: Arithmetic operator mapping (DuckDB v1.4.4)
+	// Tested against DuckDB v1.4.4. Maps Substrait function names to DuckDB operator symbols.
+	// CRITICAL: DuckDB's SUM_REWRITER optimizer specifically matches BoundFunctionExpression("+")
+	// for sum/add operations, not the generic "add" function name. This is why we map "add" → "+"
+	// instead of using make_uniq<FunctionExpression>("add", ...). The same applies to subtract (-),
+	// multiply (*), and divide (/). Without this mapping, SUM_REWRITER cannot recognize and optimize
+	// arithmetic operations in Substrait-translated queries.
+	else if (function_name == "add") {
 		if (children.size() != 2) {
 			throw InvalidInputException("add function requires exactly 2 arguments");
 		}
@@ -596,8 +606,9 @@ unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &
 	select_stmt->node = std::move(select_node);
 	auto subquery_ref = make_uniq<SubqueryRef>(std::move(select_stmt));
 
-	static int agg_subquery_counter = 0;
-	subquery_ref->alias = "agg_subquery_" + std::to_string(agg_subquery_counter++);
+	static std::atomic<int> agg_subquery_counter(0);
+	int counter_val = agg_subquery_counter.fetch_add(1, std::memory_order_relaxed);
+	subquery_ref->alias = "agg_subquery_" + std::to_string(counter_val);
 
 	return std::move(subquery_ref);
 }
@@ -782,8 +793,9 @@ unique_ptr<TableRef> SubstraitToAST::TransformReadWithProjection(const substrait
 	auto subquery = make_uniq<SubqueryRef>(std::move(select_stmt));
 
 	// Generate a unique alias for the subquery (important for DuckDB binding)
-	static int subquery_counter = 0;
-	subquery->alias = "subquery_" + std::to_string(subquery_counter++);
+	static std::atomic<int> subquery_counter(0);
+	int counter_val = subquery_counter.fetch_add(1, std::memory_order_relaxed);
+	subquery->alias = "subquery_" + std::to_string(counter_val);
 
 	return std::move(subquery);
 }
@@ -1102,6 +1114,15 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 			// Project → Cross (cross join/Cartesian product)
 			select_node->from_table = TransformCrossProductOp(project_input);
 		} else if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
+			// Passthrough projection detection (DuckDB v1.4.4 SUM_REWRITER optimization)
+			// Tested against DuckDB v1.4.4. When a Project node directly wraps an Aggregate with no
+			// additional expressions, we inline the aggregate to enable SUM_REWRITER optimization.
+			// CRITICAL: Projection boundaries in DuckDB create new optimizer instances. When a
+			// projection wraps an aggregate, the aggregate context is lost - the new optimizer instance
+			// for the projection layer doesn't see the aggregate, so it cannot apply SUM_REWRITER.
+			// By detecting passthrough projections (simple field selections of aggregate outputs),
+			// we skip the projection layer entirely and inline the aggregate directly. This preserves
+			// the aggregate context for SUM_REWRITER in the same optimizer pass.
 			// Project → Aggregate: Check if this is a simple passthrough projection
 			// that just selects aggregate outputs without computing new expressions.
 			// If so, inline the aggregate to enable DuckDB's SUM_REWRITER optimization.
