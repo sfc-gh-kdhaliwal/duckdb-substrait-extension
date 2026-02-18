@@ -30,15 +30,6 @@ public:
 	unique_ptr<TableRef> TransformPlanToTableRef();
 
 private:
-	//! Information about Project expressions for inlining into parent operations
-	struct ProjectExpressionInfo {
-		bool has_expressions = false;
-		//! Maps output field index to the actual expression
-		//! This allows parent operations (like Aggregate) to inline the expressions
-		//! instead of referencing them through a subquery
-		vector<unique_ptr<ParsedExpression>> expressions;
-	};
-
 	//! Transforms Substrait Plan Root to a TableRef
 	unique_ptr<TableRef> TransformRootOp(const substrait::RelRoot &sop);
 
@@ -78,10 +69,6 @@ private:
 
 	//! Transform Substrait Type to DuckDB LogicalType
 	static LogicalType SubstraitToDuckType(const substrait::Type &s_type);
-
-	//! Helper to substitute positional references with Project expressions (for inlining)
-	unique_ptr<ParsedExpression> SubstituteProjectExpressions(unique_ptr<ParsedExpression> expr,
-	                                                           const ProjectExpressionInfo &project_info);
 
 	//! Helper to convert positional references to column references
 	unique_ptr<ParsedExpression> ConvertPositionalToColumnRef(unique_ptr<ParsedExpression> expr,

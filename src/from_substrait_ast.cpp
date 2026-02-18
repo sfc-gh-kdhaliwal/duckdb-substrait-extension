@@ -18,7 +18,6 @@
 #include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/result_modifier.hpp"
-#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/common/exception.hpp"
 
 #include "google/protobuf/util/json_util.h"
@@ -487,41 +486,9 @@ unique_ptr<TableRef> SubstraitToAST::TransformReadOp(const substrait::Rel &sop,
 	return base_ref;
 }
 
-unique_ptr<ParsedExpression> SubstraitToAST::SubstituteProjectExpressions(unique_ptr<ParsedExpression> expr,
-                                                                           const ProjectExpressionInfo &project_info) {
-	if (!project_info.has_expressions || !expr) {
-		return expr;
-	}
-
-	// Base case: positional reference - substitute with actual Project expression
-	if (expr->type == ExpressionType::POSITIONAL_REFERENCE) {
-		auto &pos_ref = expr->Cast<PositionalReferenceExpression>();
-		// DuckDB uses 1-based indexing, convert to 0-based for lookup
-		idx_t field_idx = pos_ref.index - 1;
-
-		if (field_idx < project_info.expressions.size() && project_info.expressions[field_idx]) {
-			// Replace positional reference with the actual expression (deep copy)
-			return project_info.expressions[field_idx]->Copy();
-		}
-		// Field index out of bounds - keep as positional reference
-		return expr;
-	}
-
-	// Recursive case: use DuckDB's iterator to process all children generically
-	// This handles all expression types without needing a manual switch statement
-	ParsedExpressionIterator::EnumerateChildren(
-	    *expr,
-	    [&](unique_ptr<ParsedExpression> &child) {
-	        child = SubstituteProjectExpressions(std::move(child), project_info);
-	    });
-
-	return expr;
-}
-
 unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &sop) {
 	auto &sagg = sop.aggregate();
 	auto select_node = make_uniq<SelectNode>();
-	ProjectExpressionInfo project_expr_info;
 
 	if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
 		select_node->from_table = TransformReadWithProjection(sagg.input());
@@ -543,127 +510,10 @@ unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &
 		substrait::RelRoot temp_root;
 		temp_root.mutable_input()->CopyFrom(sagg.input());
 		select_node->from_table = TransformRootOp(temp_root);
-	} else if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kProject) {
-		// OPTIMIZATION: Inline Project expressions into Aggregate
-		// Instead of creating a subquery, we extract the Project's expressions
-		// and substitute them directly into the aggregate expressions.
-		// This allows DuckDB's optimizer to see the full picture and apply
-		// optimizations like COMMON_AGGREGATE.
-		auto &project = sagg.input().project();
-		auto &project_input = project.input();
-
-		// Transform the Project's input as the FROM clause
-		if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
-			select_node->from_table = TransformReadWithProjection(project_input);
-		} else if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kFilter) {
-			// Project → Filter → Read
-			auto &filter = project_input.filter();
-			auto &filter_input = filter.input();
-			if (filter_input.rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
-				select_node->from_table = TransformReadWithProjection(filter_input);
-				auto top_filter_expr = TransformExpr(filter.condition());
-				auto &read_input = filter_input.read();
-				if (read_input.has_base_schema()) {
-					top_filter_expr = ConvertPositionalToColumnRef(std::move(top_filter_expr), read_input.base_schema());
-				}
-				select_node->where_clause = std::move(top_filter_expr);
-			} else {
-				// Fallback: wrap Project in subquery
-				substrait::RelRoot temp_root;
-				temp_root.mutable_input()->CopyFrom(sagg.input());
-				select_node->from_table = TransformRootOp(temp_root);
-			}
-		} else {
-			// Fallback for complex Project inputs: wrap in subquery
-			substrait::RelRoot temp_root;
-			temp_root.mutable_input()->CopyFrom(sagg.input());
-			select_node->from_table = TransformRootOp(temp_root);
-		}
-
-		// Build the Project expression map for inlining
-		// In Substrait, Project output is: [input_columns] + [computed_expressions]
-		// The outputMapping (emit) selects which of these to actually output
-		project_expr_info.has_expressions = true;
-
-		// First, transform all computed expressions from the Project
-		vector<unique_ptr<ParsedExpression>> computed_exprs;
-		const substrait::NamedStruct *base_schema = nullptr;
-		if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kRead &&
-		    project_input.read().has_base_schema()) {
-			base_schema = &project_input.read().base_schema();
-		} else if (project_input.rel_type_case() == substrait::Rel::RelTypeCase::kFilter) {
-			auto &filter = project_input.filter();
-			if (filter.input().rel_type_case() == substrait::Rel::RelTypeCase::kRead &&
-			    filter.input().read().has_base_schema()) {
-				base_schema = &filter.input().read().base_schema();
-			}
-		}
-
-		for (auto &sexpr : project.expressions()) {
-			auto expr = TransformExpr(sexpr);
-			if (base_schema) {
-				expr = ConvertPositionalToColumnRef(std::move(expr), *base_schema);
-			}
-			computed_exprs.push_back(std::move(expr));
-		}
-
-		// Determine the number of input columns from the Read
-		idx_t num_inputs = 0;
-		if (base_schema) {
-			num_inputs = base_schema->names_size();
-		}
-
-		// Build the expression map based on emit/outputMapping
-		if (project.has_common() && project.common().has_emit() &&
-		    project.common().emit().output_mapping_size() > 0) {
-			auto &output_mapping = project.common().emit().output_mapping();
-
-			for (int i = 0; i < output_mapping.size(); i++) {
-				int32_t field_idx = output_mapping.Get(i);
-
-				if ((idx_t)field_idx < num_inputs) {
-					// Input column reference - use column name from schema
-					if (base_schema && field_idx < base_schema->names_size()) {
-						project_expr_info.expressions.push_back(
-						    make_uniq<ColumnRefExpression>(base_schema->names(field_idx)));
-					} else {
-						project_expr_info.expressions.push_back(
-						    make_uniq<PositionalReferenceExpression>(field_idx + 1));
-					}
-				} else {
-					// Computed expression
-					idx_t expr_idx = field_idx - num_inputs;
-					if (expr_idx < computed_exprs.size() && computed_exprs[expr_idx]) {
-						project_expr_info.expressions.push_back(computed_exprs[expr_idx]->Copy());
-					} else {
-						// Fallback: positional reference
-						project_expr_info.expressions.push_back(
-						    make_uniq<PositionalReferenceExpression>(field_idx + 1));
-					}
-				}
-			}
-		} else {
-			// No emit mapping - use expressions directly
-			// The output is [input_columns] + [computed_expressions]
-			for (idx_t i = 0; i < num_inputs; i++) {
-				if (base_schema && (int)i < base_schema->names_size()) {
-					project_expr_info.expressions.push_back(
-					    make_uniq<ColumnRefExpression>(base_schema->names(i)));
-				} else {
-					project_expr_info.expressions.push_back(
-					    make_uniq<PositionalReferenceExpression>(i + 1));
-				}
-			}
-			for (auto &expr : computed_exprs) {
-				if (expr) {
-					project_expr_info.expressions.push_back(expr->Copy());
-				}
-			}
-		}
-	} else if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kJoin ||
+	} else if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kProject ||
+	           sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kJoin ||
 	           sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kSort ||
 	           sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kFetch) {
-		// Handle Join, Sort, Fetch operations as aggregate input
 		// Wrap in RelRoot and transform recursively (same pattern as in TransformJoinOp)
 		substrait::RelRoot temp_root;
 		temp_root.mutable_input()->CopyFrom(sagg.input());
@@ -679,8 +529,6 @@ unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &
 		for (auto &sgrp : sagg.groupings()) {
 			for (auto &sgrpexpr : sgrp.grouping_expressions()) {
 				auto group_expr = TransformExpr(sgrpexpr);
-				// Substitute Project expressions if we inlined a Project
-				group_expr = SubstituteProjectExpressions(std::move(group_expr), project_expr_info);
 				// Add to both select list and group expressions
 				select_node->select_list.push_back(group_expr->Copy());
 				select_node->groups.group_expressions.push_back(std::move(group_expr));
@@ -701,8 +549,6 @@ unique_ptr<TableRef> SubstraitToAST::TransformAggregateOp(const substrait::Rel &
 		for (auto &sarg : s_aggr_function.arguments()) {
 			if (sarg.has_value()) {
 				auto arg_expr = TransformExpr(sarg.value());
-				// Substitute Project expressions if we inlined a Project
-				arg_expr = SubstituteProjectExpressions(std::move(arg_expr), project_expr_info);
 				children.push_back(std::move(arg_expr));
 			}
 		}
