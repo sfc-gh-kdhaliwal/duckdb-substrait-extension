@@ -4,13 +4,13 @@
 include(FetchContent)
 
 # ============================================================================
-# C++ Standard Override
+# C++ Standard for dependencies
 # ============================================================================
-# DuckDB uses C++11, but modern protobuf (22.x+) and abseil require C++14/17.
-# We override the C++ standard for our dependencies and extension.
-# This is ABI-compatible since we only use DuckDB's C++11-compatible public API.
-set(CMAKE_CXX_STANDARD 17 CACHE STRING "" FORCE)
-set(CMAKE_CXX_STANDARD_REQUIRED ON CACHE BOOL "" FORCE)
+# Modern protobuf (22.x+) and abseil require C++14. We set this as a local
+# variable so it applies within this subdirectory scope (protobuf/abseil
+# FetchContent) without contaminating the parent DuckDB build.
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ============================================================================
 # Abseil - Required by modern protobuf
@@ -49,10 +49,6 @@ set(protobuf_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(protobuf_INSTALL OFF CACHE BOOL "" FORCE)
 set(protobuf_MSVC_STATIC_RUNTIME OFF CACHE BOOL "" FORCE)
 set(protobuf_ABSL_PROVIDER "package" CACHE STRING "" FORCE)
-
-# Hide symbols to avoid conflicts when extension is loaded into DuckDB
-set(CMAKE_CXX_VISIBILITY_PRESET hidden CACHE STRING "" FORCE)
-set(CMAKE_VISIBILITY_INLINES_HIDDEN ON CACHE BOOL "" FORCE)
 
 FetchContent_Declare(protobuf
   URL      ${PROTOBUF_URL}

@@ -40,10 +40,13 @@ target_link_libraries(substrait_proto PRIVATE protobuf::libprotobuf)
 target_include_directories(substrait_proto 
     PUBLIC ${PROTO_OUT_DIR} ${protobuf_SOURCE_DIR}/src)
 
-# Ensure proto library uses C++17 (required by protobuf/abseil)
-set_target_properties(substrait_proto PROPERTIES 
-    CXX_STANDARD 17
+# Ensure proto library uses C++14 (required by protobuf/abseil)
+# Hide symbols to avoid conflicts when extension is loaded into DuckDB
+set_target_properties(substrait_proto PROPERTIES
+    CXX_STANDARD 14
     CXX_STANDARD_REQUIRED ON
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
 )
 
 # Generate C++ code from .proto files
@@ -71,9 +74,9 @@ add_library(${EXTENSION_NAME} STATIC
     $<TARGET_OBJECTS:substrait_proto>
 )
 
-# Ensure extension uses C++17 (required by protobuf/abseil headers)
-set_target_properties(${EXTENSION_NAME} PROPERTIES 
-    CXX_STANDARD 17
+# Ensure extension uses C++14 (required by protobuf/abseil headers)
+set_target_properties(${EXTENSION_NAME} PROPERTIES
+    CXX_STANDARD 14
     CXX_STANDARD_REQUIRED ON
 )
 
@@ -242,10 +245,12 @@ if(COMMAND build_loadable_extension)
       ${PLATFORM_LIBS}
   )
   
-  # Ensure C++17 for the loadable extension
-  set_target_properties(${TARGET_NAME}_loadable_extension PROPERTIES 
-      CXX_STANDARD 17
+  # Ensure C++14 and hidden visibility for the loadable extension
+  set_target_properties(${TARGET_NAME}_loadable_extension PROPERTIES
+      CXX_STANDARD 14
       CXX_STANDARD_REQUIRED ON
+      CXX_VISIBILITY_PRESET hidden
+      VISIBILITY_INLINES_HIDDEN ON
   )
   
   if(DEFINED ENV{SKIP_SUBSTRAIT_C_TESTS})
