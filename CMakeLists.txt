@@ -195,9 +195,25 @@ else()
     set(PLATFORM_LIBS "")
 endif()
 
+# GNU ld processes static archives left-to-right, only pulling in members that
+# resolve currently-undefined symbols. The BFS order from collect_target_files()
+# doesn't guarantee correct topological order, so circular/out-of-order deps
+# between abseil libraries cause unresolved symbols. --start-group tells the
+# linker to iterate over the enclosed archives until no new symbols resolve.
+# macOS ld does this automatically.
+if(NOT APPLE)
+    set(GROUP_START "-Wl,--start-group")
+    set(GROUP_END "-Wl,--end-group")
+else()
+    set(GROUP_START "")
+    set(GROUP_END "")
+endif()
+
 # Link using $<TARGET_FILE:> expressions - breaks CMake target graph for exports
-target_link_libraries(${EXTENSION_NAME} PRIVATE 
+target_link_libraries(${EXTENSION_NAME} PRIVATE
+    ${GROUP_START}
     ${PROTOBUF_ABSEIL_LIBS}
+    ${GROUP_END}
     ${PLATFORM_LIBS}
 )
 
@@ -220,7 +236,9 @@ if(COMMAND build_loadable_extension)
   
   # Link protobuf and abseil libraries using the same TARGET_FILE approach
   target_link_libraries(${TARGET_NAME}_loadable_extension
+      ${GROUP_START}
       ${PROTOBUF_ABSEIL_LIBS}
+      ${GROUP_END}
       ${PLATFORM_LIBS}
   )
   
