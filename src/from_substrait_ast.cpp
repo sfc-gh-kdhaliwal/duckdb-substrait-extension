@@ -42,6 +42,57 @@ const std::unordered_map<std::string, std::string> function_names_remap = {
     {"is_infinite", "isinf"}, {"extract", "date_part"},  {"bitwise_and", "&"},      {"bitwise_or", "|"},
     {"bitwise_xor", "xor"},   {"octet_length", "strlen"}};
 
+// Count output columns from a relation tree (walking through Fetch/Sort/Filter to find the leaf).
+static int CountRelOutputColumns(const substrait::Rel &rel) {
+	switch (rel.rel_type_case()) {
+	case substrait::Rel::RelTypeCase::kFetch:
+		return CountRelOutputColumns(rel.fetch().input());
+	case substrait::Rel::RelTypeCase::kSort:
+		return CountRelOutputColumns(rel.sort().input());
+	case substrait::Rel::RelTypeCase::kFilter:
+		return CountRelOutputColumns(rel.filter().input());
+	case substrait::Rel::RelTypeCase::kAggregate: {
+		int count = 0;
+		for (auto &grp : rel.aggregate().groupings()) {
+			count += grp.grouping_expressions_size();
+		}
+		count += rel.aggregate().measures_size();
+		return count;
+	}
+	case substrait::Rel::RelTypeCase::kProject: {
+		// Project output = input columns + new expressions (without emit)
+		int input_cols = CountRelOutputColumns(rel.project().input());
+		return input_cols + rel.project().expressions_size();
+	}
+	case substrait::Rel::RelTypeCase::kJoin: {
+		// Join output = left columns + right columns
+		int left_cols = CountRelOutputColumns(rel.join().left());
+		int right_cols = CountRelOutputColumns(rel.join().right());
+		return left_cols + right_cols;
+	}
+	case substrait::Rel::RelTypeCase::kCross: {
+		// Cross product output = left columns + right columns
+		int left_cols = CountRelOutputColumns(rel.cross().left());
+		int right_cols = CountRelOutputColumns(rel.cross().right());
+		return left_cols + right_cols;
+	}
+	case substrait::Rel::RelTypeCase::kSet:
+		// Set operations output the columns of the first input
+		if (rel.set().inputs_size() > 0) {
+			return CountRelOutputColumns(rel.set().inputs(0));
+		}
+		return 0;
+	case substrait::Rel::RelTypeCase::kRead: {
+		if (rel.read().has_base_schema()) {
+			return rel.read().base_schema().names_size();
+		}
+		return 0;
+	}
+	default:
+		return 0;
+	}
+}
+
 SubstraitToAST::SubstraitToAST(ClientContext &context_p, const string &serialized, bool json) : context(context_p) {
 	if (!json) {
 		if (!plan.ParseFromString(serialized)) {
@@ -541,11 +592,19 @@ unique_ptr<SelectNode> SubstraitToAST::TransformAggregateOpRaw(const substrait::
 		} else {
 			substrait::RelRoot temp_root;
 			temp_root.mutable_input()->CopyFrom(sagg.input());
+			int num_cols = CountRelOutputColumns(sagg.input());
+			for (int i = 0; i < num_cols; i++) {
+				temp_root.add_names("col_" + std::to_string(i));
+			}
 			select_node->from_table = TransformRootOp(temp_root);
 		}
 	} else if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kAggregate) {
 		substrait::RelRoot temp_root;
 		temp_root.mutable_input()->CopyFrom(sagg.input());
+		int num_cols = CountRelOutputColumns(sagg.input());
+		for (int i = 0; i < num_cols; i++) {
+			temp_root.add_names("col_" + std::to_string(i));
+		}
 		select_node->from_table = TransformRootOp(temp_root);
 	} else if (sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kProject ||
 	           sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kJoin ||
@@ -553,6 +612,10 @@ unique_ptr<SelectNode> SubstraitToAST::TransformAggregateOpRaw(const substrait::
 	           sagg.input().rel_type_case() == substrait::Rel::RelTypeCase::kFetch) {
 		substrait::RelRoot temp_root;
 		temp_root.mutable_input()->CopyFrom(sagg.input());
+		int num_cols = CountRelOutputColumns(sagg.input());
+		for (int i = 0; i < num_cols; i++) {
+			temp_root.add_names("col_" + std::to_string(i));
+		}
 		select_node->from_table = TransformRootOp(temp_root);
 	} else {
 		throw NotImplementedException(
@@ -856,6 +919,10 @@ unique_ptr<TableRef> SubstraitToAST::TransformJoinOp(const substrait::Rel &sop) 
 		// Wrap in RelRoot and transform recursively
 		substrait::RelRoot temp_root;
 		temp_root.mutable_input()->CopyFrom(sjoin.left());
+		int num_cols = CountRelOutputColumns(sjoin.left());
+		for (int i = 0; i < num_cols; i++) {
+			temp_root.add_names("col_" + std::to_string(i));
+		}
 		join_ref->left = TransformRootOp(temp_root);
 	} else {
 		throw NotImplementedException(
@@ -876,6 +943,10 @@ unique_ptr<TableRef> SubstraitToAST::TransformJoinOp(const substrait::Rel &sop) 
 		// Wrap in RelRoot and transform recursively
 		substrait::RelRoot temp_root;
 		temp_root.mutable_input()->CopyFrom(sjoin.right());
+		int num_cols = CountRelOutputColumns(sjoin.right());
+		for (int i = 0; i < num_cols; i++) {
+			temp_root.add_names("col_" + std::to_string(i));
+		}
 		join_ref->right = TransformRootOp(temp_root);
 	} else {
 		throw NotImplementedException(
@@ -917,6 +988,10 @@ unique_ptr<TableRef> SubstraitToAST::TransformCrossProductOp(const substrait::Re
 		// Handle other relation types by wrapping in RelRoot
 		substrait::RelRoot temp_root;
 		temp_root.mutable_input()->CopyFrom(scross.left());
+		int num_cols = CountRelOutputColumns(scross.left());
+		for (int i = 0; i < num_cols; i++) {
+			temp_root.add_names("col_" + std::to_string(i));
+		}
 		join_ref->left = TransformRootOp(temp_root);
 	}
 
@@ -926,6 +1001,10 @@ unique_ptr<TableRef> SubstraitToAST::TransformCrossProductOp(const substrait::Re
 		// Handle other relation types by wrapping in RelRoot
 		substrait::RelRoot temp_root;
 		temp_root.mutable_input()->CopyFrom(scross.right());
+		int num_cols = CountRelOutputColumns(scross.right());
+		for (int i = 0; i < num_cols; i++) {
+			temp_root.add_names("col_" + std::to_string(i));
+		}
 		join_ref->right = TransformRootOp(temp_root);
 	}
 
@@ -1199,6 +1278,9 @@ unique_ptr<TableRef> SubstraitToAST::TransformRootOp(const substrait::RelRoot &s
 			// The reverse-iteration fix ensures correct modifier ordering
 			substrait::RelRoot temp_root;
 			temp_root.mutable_input()->CopyFrom(project_input);
+			for (int i = 0; i < sop.names_size(); i++) {
+				temp_root.add_names(sop.names(i));
+			}
 			select_node->from_table = TransformRootOp(temp_root);
 		} else {
 			throw NotImplementedException(
