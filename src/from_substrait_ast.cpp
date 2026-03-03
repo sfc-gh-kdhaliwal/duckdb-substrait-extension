@@ -48,7 +48,7 @@ SubstraitToAST::SubstraitToAST(ClientContext &context_p, const string &serialize
 			throw std::runtime_error("Could not parse binary Substrait plan");
 		}
 	} else {
-		google::protobuf::util::Status status = google::protobuf::util::JsonStringToMessage(serialized, &plan);
+		auto status = google::protobuf::util::JsonStringToMessage(serialized, &plan);
 		if (!status.ok()) {
 			throw std::runtime_error("Could not parse JSON Substrait plan: " + status.ToString());
 		}
@@ -507,6 +507,17 @@ unique_ptr<TableRef> SubstraitToAST::TransformReadOp(const substrait::Rel &sop,
 				values_ref->values.push_back(std::move(expr_row));
 			}
 
+			values_ref->alias = "values";
+			base_ref = unique_ptr<TableRef>(values_ref.release());
+		} else if (!sget.virtual_table().expressions().empty()) {
+			auto values_ref = make_uniq<ExpressionListRef>();
+			for (auto &row : sget.virtual_table().expressions()) {
+				vector<unique_ptr<ParsedExpression>> expr_row;
+				for (const auto &field : row.fields()) {
+					expr_row.push_back(TransformExpr(field));
+				}
+				values_ref->values.push_back(std::move(expr_row));
+			}
 			values_ref->alias = "values";
 			base_ref = unique_ptr<TableRef>(values_ref.release());
 		} else {

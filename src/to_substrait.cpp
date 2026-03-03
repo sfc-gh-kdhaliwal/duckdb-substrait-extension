@@ -1142,8 +1142,8 @@ void PrintRelAsJson(substrait::Rel *rel) {
 	static int i;
 	std::string json_output;
 	google::protobuf::util::JsonPrintOptions options;
-	options.add_whitespace = false;               // Pretty-print with indentation
-	options.always_print_primitive_fields = true; // Print even if default values
+	options.add_whitespace = false;                      // Pretty-print with indentation
+	options.always_print_fields_with_no_presence = true; // Print even if default values
 
 	auto status = google::protobuf::util::MessageToJsonString(*rel, &json_output, options);
 	if (!status.ok()) {
@@ -1914,6 +1914,20 @@ substrait::RelRoot *DuckDBToSubstrait::TransformRootOp(LogicalOperator &dop) {
 		if (IsSetOperation(*current_op)) {
 			// Take the projection from the first child of the set operation
 			D_ASSERT(current_op->children.size() == 2);
+			current_op = current_op->children[1].get();
+			continue;
+		}
+		if (current_op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+		    current_op->type == LogicalOperatorType::LOGICAL_ANY_JOIN ||
+		    current_op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+		    current_op->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+			// For join operators, traverse the left child to find the projection
+			current_op = current_op->children[0].get();
+			continue;
+		}
+		if (current_op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
+		    current_op->type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE) {
+			// For CTEs, traverse the right child (the main query that references the CTE)
 			current_op = current_op->children[1].get();
 			continue;
 		}
