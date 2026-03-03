@@ -1917,6 +1917,20 @@ substrait::RelRoot *DuckDBToSubstrait::TransformRootOp(LogicalOperator &dop) {
 			current_op = current_op->children[1].get();
 			continue;
 		}
+		if (current_op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+		    current_op->type == LogicalOperatorType::LOGICAL_ANY_JOIN ||
+		    current_op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+		    current_op->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+			// For join operators, traverse the left child to find the projection
+			current_op = current_op->children[0].get();
+			continue;
+		}
+		if (current_op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
+		    current_op->type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE) {
+			// For CTEs, traverse the right child (the main query that references the CTE)
+			current_op = current_op->children[1].get();
+			continue;
+		}
 		if (current_op->children.size() != 1) {
 			if (current_op->type == LogicalOperatorType::LOGICAL_CREATE_TABLE) {
 				break;
